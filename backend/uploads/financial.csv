@@ -1,0 +1,4 @@
+Date,Description,Type,Amount,Category
+2026-01-01,Product Sales,Credit,50000,Revenue
+2026-01-05,Office Rent,Debit,12000,Expense
+2026-01-10,Supplier Invoice,Debit,15000,COGS
