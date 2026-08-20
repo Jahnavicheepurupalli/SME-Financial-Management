@@ -8,10 +8,13 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from backend.config import Config
 from backend.services.vector_store import VectorStoreManager
-from backend.database.db import mongo_db, SessionLocal
+from backend.database.db import mongo_db, SessionLocal, session_scope
 from backend.models.models import Document, AnalysisHistory
 from backend.services.pdf_generator import PDFReportGenerator
 from backend.exceptions import AnalysisStorageError
+from backend.utils.chunks import format_chunks
+from backend.utils.numeric import safe_ratio, to_float
+from backend.utils.paths import report_path
 logger = logging.getLogger(__name__)
 
 # List of allowed topics for chatbot
@@ -72,37 +75,30 @@ def document_reader_tool(query: str) -> str:
     results = vstore.similarity_search(query, k=10)
     if not results:
         return "No relevant text chunks found in document database."
-    
-    formatted_chunks = []
-    for r in results:
-        chunk = r["chunk"]
-        source_doc = chunk.get("source_doc", "Unknown")
-        page_num = chunk.get("page_num", "Unknown")
-        text = chunk.get("text", "")
-        formatted_chunks.append(f"--- SOURCE: {source_doc}, Page: {page_num} ---\n{text}\n")
 
-    return "\n".join(formatted_chunks)
+    return format_chunks(
+        [r["chunk"] for r in results],
+        header="--- SOURCE: {source}, Page: {page} ---",
+        separator="\n\n"
+    )
 
 def _generate_pdf(document_id: int, analysis_data: dict) -> str:
-    db = SessionLocal()
     try:
-        doc_record = db.query(Document).filter(Document.id == document_id).first()
-        if not doc_record:
-            raise AnalysisStorageError(f"Document with ID {document_id} not found.")
-            
-        filename = f"report_{document_id}.pdf"
-        pdf_path = os.path.join(Config.REPORTS_FOLDER, filename)
-        try:
-            PDFReportGenerator.generate(pdf_path, doc_record.filename, analysis_data)
-        except Exception as e:
-            raise AnalysisStorageError(f"Unable to generate PDF report for document {document_id}.") from e
-        return pdf_path
+        with session_scope(SessionLocal) as db:
+            doc_record = db.query(Document).filter(Document.id == document_id).first()
+            if not doc_record:
+                raise AnalysisStorageError(f"Document with ID {document_id} not found.")
+
+            pdf_path = report_path(document_id)
+            try:
+                PDFReportGenerator.generate(pdf_path, doc_record.filename, analysis_data)
+            except Exception as e:
+                raise AnalysisStorageError(f"Unable to generate PDF report for document {document_id}.") from e
+            return pdf_path
     except AnalysisStorageError:
         raise
     except Exception as e:
         raise AnalysisStorageError(f"Unable to generate PDF report for document {document_id}.") from e
-    finally:
-        db.close()
 
 def _store_analysis_in_mongo(document_id: int, analysis_data: dict, reasoning_log: str):
     try:
@@ -129,25 +125,21 @@ def _store_analysis_in_mongo(document_id: int, analysis_data: dict, reasoning_lo
         raise AnalysisStorageError(f"Unable to save analysis for document {document_id}.") from e
 
 def _update_mysql_storage(document_id: int, status: str):
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if not doc:
-            raise AnalysisStorageError(f"Document with ID {document_id} not found.")
-        doc.status = status
-        db.commit()
+        with session_scope(SessionLocal) as db:
+            doc = db.query(Document).filter(Document.id == document_id).first()
+            if not doc:
+                raise AnalysisStorageError(f"Document with ID {document_id} not found.")
+            doc.status = status
+            db.commit()
 
-        history = AnalysisHistory(user_id=doc.user_id, document_id=document_id, status=status)
-        db.add(history)
-        db.commit()
+            history = AnalysisHistory(user_id=doc.user_id, document_id=document_id, status=status)
+            db.add(history)
+            db.commit()
     except AnalysisStorageError:
-        db.rollback()
         raise
     except Exception as e:
-        db.rollback()
         raise AnalysisStorageError(f"Unable to update status for document {document_id}.") from e
-    finally:
-        db.close()
 
 
 def _mark_analysis_failed(document_id):
@@ -214,22 +206,17 @@ class FinancialIntelligenceAgent:
         filename = "Unknown Document"
         file_path = ""
         
-        db = SessionLocal()
-        doc_record = db.query(Document).filter(Document.id == document_id).first()
-        if doc_record:
-            filename = doc_record.filename
-            file_path = doc_record.file_path
-        db.close()
+        with session_scope(SessionLocal) as db:
+            doc_record = db.query(Document).filter(Document.id == document_id).first()
+            if doc_record:
+                filename = doc_record.filename
+                file_path = doc_record.file_path
         
         # Pre-calculate precise metrics locally
         calculated_metrics = self._calculate_metrics_directly(file_path, all_chunks, filename)
         
         # Construct summary context
-        doc_contents = []
-        for idx, c in enumerate(all_chunks[:25]):
-            doc_contents.append(f"[Source: {c.get('source_doc')}, Page: {c.get('page_num')}]\n{c.get('text')}")
-        
-        context_str = "\n\n".join(doc_contents)
+        context_str = format_chunks(all_chunks[:25])
         
         system_prompt = """You are an expert Financial Document Intelligence Agent for SMEs.
 Your responsibility is ONLY to analyze uploaded financial documents and output a structured report in JSON format.
@@ -411,14 +398,10 @@ Document Context:
         vstore = VectorStoreManager.get_instance()
         search_results = vstore.similarity_search(query, k=8)
         
-        context_chunks = []
-        for r in search_results:
-            text = r["chunk"].get("text", "")
-            source = r["chunk"].get("source_doc", "Doc")
-            page = r["chunk"].get("page_num", 1)
-            context_chunks.append(f"[Source: {source}, Page {page}]\n{text}")
-            
-        context_str = "\n\n".join(context_chunks)
+        context_str = format_chunks(
+            [r["chunk"] for r in search_results],
+            header="[Source: {source}, Page {page}]"
+        )
         
         # Get metrics if available
         metrics_summary = ""
@@ -572,10 +555,10 @@ Document Context Chunks:
                         # Current state calculations
                         assets = max(300000.0, revenue - expense + 100000.0)
                         liabilities = max(80000.0, expense * 0.15)
-                        metrics["current_ratio"] = round(assets / liabilities, 2) if liabilities > 0 else 1.5
-                        metrics["quick_ratio"] = round(assets * 0.8 / liabilities, 2) if liabilities > 0 else 1.2
-                        metrics["debt_ratio"] = round(liabilities / assets, 2) if assets > 0 else 0.45
-                        metrics["profit_margin"] = round((metrics["net_profit"] / revenue) * 100, 2) if revenue > 0 else 15.0
+                        metrics["current_ratio"] = safe_ratio(assets, liabilities, 1.5)
+                        metrics["quick_ratio"] = safe_ratio(assets * 0.8, liabilities, 1.2)
+                        metrics["debt_ratio"] = safe_ratio(liabilities, assets, 0.45)
+                        metrics["profit_margin"] = safe_ratio(metrics["net_profit"] * 100, revenue, 15.0)
                         metrics["operating_margin"] = round(metrics["profit_margin"] * 0.85, 2)
                         
                         # Monthly values
@@ -593,23 +576,29 @@ Document Context Chunks:
                         charts["cash_flow"] = charts["profit_trend"]
                         
                         num_months = len(active_months)
-                        metrics["avg_monthly_revenue"] = round(revenue / num_months, 2) if num_months > 0 else revenue
-                        metrics["avg_monthly_expense"] = round(expense / num_months, 2) if num_months > 0 else expense
+                        metrics["avg_monthly_revenue"] = safe_ratio(revenue, num_months, revenue)
+                        metrics["avg_monthly_expense"] = safe_ratio(expense, num_months, expense)
                         
                     # 2. Check if Financial Statements (AAPL/MSFT style columns)
                     elif "revenue" in df.columns or "net income" in df.columns:
                         latest_row = df.iloc[0]
-                        metrics["total_revenue"] = float(str(latest_row.get("revenue", 1250000)).replace(",", ""))
-                        metrics["net_profit"] = float(str(latest_row.get("net income", latest_row.get("net_profit", 187500))).replace(",", ""))
-                        metrics["gross_profit"] = float(str(latest_row.get("gross profit", latest_row.get("gross_profit", metrics["total_revenue"] * 0.6))).replace(",", ""))
+                        metrics["total_revenue"] = to_float(latest_row.get("revenue"), 1250000)
+                        metrics["net_profit"] = to_float(latest_row.get("net income", latest_row.get("net_profit")), 187500)
+                        metrics["gross_profit"] = to_float(
+                            latest_row.get("gross profit", latest_row.get("gross_profit")),
+                            metrics["total_revenue"] * 0.6
+                        )
                         metrics["total_expense"] = metrics["total_revenue"] - metrics["net_profit"]
-                        
-                        metrics["current_ratio"] = float(str(latest_row.get("current ratio", latest_row.get("current_ratio", 1.8))) or 1.8)
-                        metrics["debt_ratio"] = float(str(latest_row.get("debt/equity ratio", latest_row.get("debt_ratio", 0.35))) or 0.35)
+
+                        metrics["current_ratio"] = to_float(latest_row.get("current ratio", latest_row.get("current_ratio")), 1.8)
+                        metrics["debt_ratio"] = to_float(latest_row.get("debt/equity ratio", latest_row.get("debt_ratio")), 0.35)
                         metrics["quick_ratio"] = round(metrics["current_ratio"] * 0.85, 2)
-                        metrics["profit_margin"] = round((metrics["net_profit"] / metrics["total_revenue"]) * 100, 2) if metrics["total_revenue"] > 0 else 15.0
+                        metrics["profit_margin"] = safe_ratio(metrics["net_profit"] * 100, metrics["total_revenue"], 15.0)
                         metrics["operating_margin"] = round(metrics["profit_margin"] * 0.9, 2)
-                        metrics["cash_flow"] = float(str(latest_row.get("cash flow from operating", latest_row.get("cash_flow", metrics["net_profit"] * 1.1))).replace(",", ""))
+                        metrics["cash_flow"] = to_float(
+                            latest_row.get("cash flow from operating", latest_row.get("cash_flow")),
+                            metrics["net_profit"] * 1.1
+                        )
                         metrics_source = "extracted"
                         data_quality = "Metrics extracted from the uploaded financial statement."
                         
@@ -625,11 +614,11 @@ Document Context Chunks:
                         labels = []
                         for r_idx in range(rows_count):
                             row = df.iloc[rows_count - 1 - r_idx]
-                            revs.append(float(str(row.get("revenue", 0)).replace(",", "")))
-                            net_inc = float(str(row.get("net income", row.get("net_profit", 0))).replace(",", ""))
+                            revs.append(to_float(row.get("revenue")))
+                            net_inc = to_float(row.get("net income", row.get("net_profit")))
                             profs.append(net_inc)
                             exps.append(revs[-1] - net_inc)
-                            cfs.append(float(str(row.get("cash flow from operating", net_inc * 1.1)).replace(",", "")))
+                            cfs.append(to_float(row.get("cash flow from operating"), net_inc * 1.1))
                             labels.append(str(row.get("year", row.get("company", f"Yr {r_idx+1}"))))
                             
                         charts["monthly_comparison"]["labels"] = labels
@@ -697,11 +686,11 @@ Document Context Chunks:
             "total_expense": total_expense,
             "net_profit": net_profit,
             "gross_profit": gross_profit,
-            "current_ratio": round(assets / liabilities, 2) if liabilities > 0 else 1.8,
-            "quick_ratio": round((assets * 0.75) / liabilities, 2) if liabilities > 0 else 1.4,
-            "debt_ratio": round(liabilities / assets, 2) if assets > 0 else 0.43,
-            "profit_margin": round((net_profit / revenue) * 100, 2) if revenue > 0 else 15.05,
-            "operating_margin": round((net_profit / revenue) * 85.0, 2) if revenue > 0 else 12.8,
+            "current_ratio": safe_ratio(assets, liabilities, 1.8),
+            "quick_ratio": safe_ratio(assets * 0.75, liabilities, 1.4),
+            "debt_ratio": safe_ratio(liabilities, assets, 0.43),
+            "profit_margin": safe_ratio(net_profit * 100, revenue, 15.05),
+            "operating_margin": safe_ratio(net_profit * 85.0, revenue, 12.8),
             "cash_flow": net_profit * 0.95,
             "avg_monthly_expense": round(total_expense / 12, 2),
             "avg_monthly_revenue": round(revenue / 12, 2)

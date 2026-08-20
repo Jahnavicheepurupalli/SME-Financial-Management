@@ -2,6 +2,9 @@ import json
 import os
 import logging
 import tempfile
+from contextlib import contextmanager
+from uuid import uuid4
+
 import pymysql
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -53,6 +56,17 @@ except Exception:
 Base = declarative_base()
 
 # MongoDB setup with fallback
+def _matches(item, query):
+    return all(item.get(key) == value for key, value in (query or {}).items())
+
+
+def _find_index(collection, query):
+    for idx, item in enumerate(collection):
+        if _matches(item, query):
+            return idx
+    return -1
+
+
 class MockMongoCollection:
     def __init__(self, db_path, collection_name):
         self.db_path = db_path
@@ -101,9 +115,8 @@ class MockMongoCollection:
         
         # If document doesn't have _id, generate it
         if '_id' not in document:
-            from uuid import uuid4
             document['_id'] = str(uuid4())
-            
+
         data[self.collection_name].append(document)
         self._write_data(data)
         return type('InsertOneResult', (object,), {'inserted_id': document['_id']})()
@@ -111,56 +124,30 @@ class MockMongoCollection:
     def find_one(self, query):
         data = self._read_data()
         collection = data.get(self.collection_name, [])
-        for item in collection:
-            match = True
-            for k, v in query.items():
-                if item.get(k) != v:
-                    match = False
-                    break
-            if match:
-                return item
-        return None
+        idx = _find_index(collection, query)
+        return collection[idx] if idx != -1 else None
 
     def find(self, query=None):
         data = self._read_data()
         collection = data.get(self.collection_name, [])
         if not query:
             return collection
-        
-        results = []
-        for item in collection:
-            match = True
-            for k, v in query.items():
-                if item.get(k) != v:
-                    match = False
-                    break
-            if match:
-                results.append(item)
-        return results
+
+        return [item for item in collection if _matches(item, query)]
 
     def replace_one(self, filter_query, replacement, upsert=False):
         data = self._read_data()
         if self.collection_name not in data:
             data[self.collection_name] = []
         collection = data.get(self.collection_name, [])
-        found_idx = -1
-        for idx, item in enumerate(collection):
-            match = True
-            for k, v in filter_query.items():
-                if item.get(k) != v:
-                    match = False
-                    break
-            if match:
-                found_idx = idx
-                break
-                
+        found_idx = _find_index(collection, filter_query)
+
         if found_idx != -1:
             if '_id' not in replacement and '_id' in collection[found_idx]:
                 replacement['_id'] = collection[found_idx]['_id']
             collection[found_idx] = replacement
         elif upsert:
             if '_id' not in replacement:
-                from uuid import uuid4
                 replacement['_id'] = str(uuid4())
             collection.append(replacement)
             
@@ -171,16 +158,7 @@ class MockMongoCollection:
     def delete_one(self, query):
         data = self._read_data()
         collection = data.get(self.collection_name, [])
-        found_idx = -1
-        for idx, item in enumerate(collection):
-            match = True
-            for k, v in query.items():
-                if item.get(k) != v:
-                    match = False
-                    break
-            if match:
-                found_idx = idx
-                break
+        found_idx = _find_index(collection, query)
         if found_idx != -1:
             collection.pop(found_idx)
         data[self.collection_name] = collection
@@ -190,18 +168,8 @@ class MockMongoCollection:
     def delete_many(self, query):
         data = self._read_data()
         collection = data.get(self.collection_name, [])
-        new_collection = []
-        deleted_count = 0
-        for item in collection:
-            match = True
-            for k, v in query.items():
-                if item.get(k) != v:
-                    match = False
-                    break
-            if match:
-                deleted_count += 1
-            else:
-                new_collection.append(item)
+        new_collection = [item for item in collection if not _matches(item, query)]
+        deleted_count = len(collection) - len(new_collection)
         data[self.collection_name] = new_collection
         self._write_data(data)
         return type('DeleteResult', (object,), {'deleted_count': deleted_count})()
@@ -263,5 +231,18 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def session_scope(session_factory):
+    """Yields a session, rolling back on failure and always closing it."""
+    db = session_factory()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

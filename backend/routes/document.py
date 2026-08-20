@@ -4,17 +4,33 @@ from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
 from backend.config import Config
-from backend.database.db import SessionLocal, mongo_db
+from backend.database.db import SessionLocal, session_scope, mongo_db
 from backend.models.models import Document, AnalysisHistory
 from backend.services.parser import DocumentParser
 from backend.services.vector_store import VectorStoreManager
 from backend.agents.agent import FinancialIntelligenceAgent
 from backend.exceptions import AnalysisStorageError, DocumentParseError
+from backend.utils.paths import report_path
+from backend.utils.responses import error_response, internal_error, success_response
+from backend.utils.serializers import serialize_document, serialize_history_entry
 logger = logging.getLogger(__name__)
 
 doc_bp = Blueprint('document', __name__)
 
 ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls'}
+
+NON_FINANCIAL_MESSAGE = (
+    "This platform only accepts financial documents such as invoices, bank statements, "
+    "balance sheets, profit and loss statements, cash flow reports, and other business "
+    "financial records."
+)
+
+
+def get_owned_document(db, doc_id, user_id):
+    return db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == int(user_id)
+    ).first()
 
 
 def _remove_file(file_path):
@@ -27,17 +43,14 @@ def _remove_file(file_path):
 
 
 def _mark_document_failed(document_id):
-    failed_db = SessionLocal()
     try:
-        failed_doc = failed_db.query(Document).filter(Document.id == document_id).first()
-        if failed_doc:
-            failed_doc.status = "failed"
-            failed_db.commit()
+        with session_scope(SessionLocal) as failed_db:
+            failed_doc = failed_db.query(Document).filter(Document.id == document_id).first()
+            if failed_doc:
+                failed_doc.status = "failed"
+                failed_db.commit()
     except Exception:
-        failed_db.rollback()
         logger.exception("Unable to mark document %s as failed.", document_id)
-    finally:
-        failed_db.close()
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -132,23 +145,21 @@ def upload_file():
     user_id = get_jwt_identity()
     
     if 'file' not in request.files:
-        return jsonify({"message": "No file part in the request"}), 400
-        
+        return error_response("No file part in the request")
+
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"message": "No selected file"}), 400
+        return error_response("No selected file")
 
     if not allowed_file(file.filename):
-        return jsonify({
-            "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
-        }), 400
+        return error_response(NON_FINANCIAL_MESSAGE)
 
     # Ensure upload folder exists
     try:
         os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
     except OSError:
         logger.exception("Unable to prepare upload folder %s.", Config.UPLOAD_FOLDER)
-        return jsonify({"message": "Unable to prepare storage for the uploaded file. Please try again."}), 500
+        return error_response("Unable to prepare storage for the uploaded file. Please try again.", 500)
     
     filename = secure_filename(file.filename)
     file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
@@ -157,20 +168,13 @@ def upload_file():
         file_size = os.path.getsize(file_path)
     except Exception:
         logger.exception("Unable to save or inspect uploaded file %s.", filename)
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                logger.warning("Unable to remove incomplete upload %s.", file_path, exc_info=True)
-        return jsonify({"message": "Unable to save the uploaded file. Please try again."}), 500
+        _remove_file(file_path)
+        return error_response("Unable to save the uploaded file. Please try again.", 500)
 
     # Validate file size
     if file_size > 10 * 1024 * 1024:  # 10 MB limit
-        try:
-            os.remove(file_path)
-        except OSError:
-            logger.warning("Unable to remove oversized upload %s.", file_path, exc_info=True)
-        return jsonify({"message": "File exceeds the 10MB size limit."}), 400
+        _remove_file(file_path)
+        return error_response("File exceeds the 10MB size limit.")
 
     # Determine file type category
     ext = filename.rsplit('.', 1)[1].lower()
@@ -185,21 +189,12 @@ def upload_file():
         is_financial_file = check_is_financial_file(file_path, file_type)
     except DocumentParseError as e:
         logger.warning("Uploaded file failed content validation: %s", e, exc_info=True)
-        try:
-            os.remove(file_path)
-        except OSError:
-            logger.warning("Unable to remove unreadable upload %s.", file_path, exc_info=True)
-        return jsonify({"message": e.user_message}), 422
+        _remove_file(file_path)
+        return error_response(e.user_message, 422)
 
     if not is_financial_file:
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                logger.warning("Unable to remove rejected upload %s.", file_path, exc_info=True)
-        return jsonify({
-            "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
-        }), 400
+        _remove_file(file_path)
+        return error_response(NON_FINANCIAL_MESSAGE)
 
     # Initialize MySQL DB session and create record since file is validated
     db = SessionLocal()
@@ -217,19 +212,19 @@ def upload_file():
         db.refresh(doc_record)
 
         # 1. Document Parsing & Text Extraction
-        chunks = []
-        if file_type == "PDF":
-            chunks = DocumentParser.parse_pdf(file_path)
-        elif file_type == "CSV":
-            chunks = DocumentParser.parse_csv(file_path)
-        elif file_type == "Excel":
-            chunks = DocumentParser.parse_excel(file_path)
+        parsers = {
+            "PDF": DocumentParser.parse_pdf,
+            "CSV": DocumentParser.parse_csv,
+            "Excel": DocumentParser.parse_excel
+        }
+        parser = parsers.get(file_type)
+        chunks = parser(file_path) if parser else []
 
         if not chunks:
             doc_record.status = "failed"
             db.commit()
             _remove_file(file_path)
-            return jsonify({"message": "Document contains no extractable data or is corrupted."}), 400
+            return error_response("Document contains no extractable data or is corrupted.")
 
         # 2. Chunking & Embeddings
         vstore = VectorStoreManager.get_instance()
@@ -240,25 +235,19 @@ def upload_file():
         agent = FinancialIntelligenceAgent()
         analysis_result = agent.run_analysis(doc_record.id)
 
-        return jsonify({
-            "success": True,
-            "current_state_analysis": analysis_result.get("current_state_analysis", {}),
-            "gap_detection": analysis_result.get("gap_detection", []),
-            "forward_looking_flags": analysis_result.get("forward_looking_flags", []),
-            "metrics": analysis_result.get("metrics", {}),
-            "charts": analysis_result.get("charts", {}),
-            "analysis_mode": analysis_result.get("analysis_mode", "llm"),
-            "degraded_reason": analysis_result.get("degraded_reason"),
-            "metrics_source": analysis_result.get("metrics_source"),
-            "data_quality": analysis_result.get("data_quality"),
-            "pdf_url": f"/api/report/{doc_record.id}",
-            "document": {
-                "id": doc_record.id,
-                "filename": doc_record.filename,
-                "file_type": doc_record.file_type,
-                "status": "analyzed"
-            }
-        }), 200
+        return success_response(
+            current_state_analysis=analysis_result.get("current_state_analysis", {}),
+            gap_detection=analysis_result.get("gap_detection", []),
+            forward_looking_flags=analysis_result.get("forward_looking_flags", []),
+            metrics=analysis_result.get("metrics", {}),
+            charts=analysis_result.get("charts", {}),
+            analysis_mode=analysis_result.get("analysis_mode", "llm"),
+            degraded_reason=analysis_result.get("degraded_reason"),
+            metrics_source=analysis_result.get("metrics_source"),
+            data_quality=analysis_result.get("data_quality"),
+            pdf_url=f"/api/report/{doc_record.id}",
+            document=serialize_document(doc_record, status="analyzed")
+        )
 
     except DocumentParseError as e:
         db.rollback()
@@ -266,20 +255,20 @@ def upload_file():
         if doc_record:
             _mark_document_failed(doc_record.id)
         _remove_file(file_path)
-        return jsonify({"message": e.user_message}), 422
+        return error_response(e.user_message, 422)
     except AnalysisStorageError:
         db.rollback()
         logger.exception("Analysis for document %s could not be saved.", filename)
         if doc_record:
             _mark_document_failed(doc_record.id)
-        return jsonify({"message": "Analysis could not be saved. Please try again."}), 500
+        return error_response("Analysis could not be saved. Please try again.", 500)
     except Exception:
         db.rollback()
         logger.exception("Unexpected error during upload/analysis processing for %s.", filename)
         if doc_record:
             _mark_document_failed(doc_record.id)
         _remove_file(file_path)
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
+        return internal_error()
     finally:
         db.close()
 
@@ -287,76 +276,59 @@ def upload_file():
 @jwt_required()
 def get_history():
     user_id = get_jwt_identity()
-    db = SessionLocal()
     try:
-        docs = db.query(Document).filter(Document.user_id == int(user_id)).order_by(Document.created_at.desc()).all()
-        history_list = []
-        for doc in docs:
-            history_list.append({
-                "id": doc.id,
-                "filename": doc.filename,
-                "file_type": doc.file_type,
-                "status": doc.status,
-                "created_at": doc.created_at.isoformat()
-            })
-        return jsonify({"history": history_list}), 200
+        with session_scope(SessionLocal) as db:
+            docs = db.query(Document).filter(Document.user_id == int(user_id)).order_by(Document.created_at.desc()).all()
+            return jsonify({"history": [serialize_history_entry(doc) for doc in docs]}), 200
     except Exception:
         logger.exception("Unexpected error while loading document history.")
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
-    finally:
-        db.close()
+        return internal_error()
 
 @doc_bp.route('/history/<int:doc_id>', methods=['GET'])
 @jwt_required()
 def get_history_detail(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found"}), 404
-            
-        result = mongo_db["analysis_results"].find_one({"document_id": doc_id})
-        if not result:
-            return jsonify({"message": "Analysis details not found"}), 404
-            
-        if '_id' in result:
-            result['_id'] = str(result['_id'])
-            
-        return jsonify({"analysis": result, "filename": doc.filename}), 200
+        with session_scope(SessionLocal) as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found", 404)
+
+            result = mongo_db["analysis_results"].find_one({"document_id": doc_id})
+            if not result:
+                return error_response("Analysis details not found", 404)
+
+            if '_id' in result:
+                result['_id'] = str(result['_id'])
+
+            return jsonify({"analysis": result, "filename": doc.filename}), 200
     except Exception:
         logger.exception("Unexpected error while loading analysis details for document %s.", doc_id)
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
-    finally:
-        db.close()
+        return internal_error()
 
 @doc_bp.route('/report/<int:doc_id>', methods=['GET'])
 @jwt_required()
 def download_report(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found"}), 404
-            
-        pdf_name = f"report_{doc_id}.pdf"
-        pdf_path = os.path.join(Config.REPORTS_FOLDER, pdf_name)
-        
-        if not os.path.exists(pdf_path):
-            return jsonify({"message": "PDF report file not found on server."}), 404
-            
-        return send_file(
-            pdf_path,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f"Financial_Analysis_{doc.filename}.pdf"
-        )
+        with session_scope(SessionLocal) as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found", 404)
+
+            pdf_path = report_path(doc_id)
+            if not os.path.exists(pdf_path):
+                return error_response("PDF report file not found on server.", 404)
+
+            return send_file(
+                pdf_path,
+                mimetype='application/pdf',
+                as_attachment=True,
+                download_name=f"Financial_Analysis_{doc.filename}.pdf"
+            )
     except Exception:
         logger.exception("Unexpected error while downloading report for document %s.", doc_id)
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
-    finally:
-        db.close()
+        return internal_error()
 
 @doc_bp.route('/chat', methods=['POST'])
 @doc_bp.route('/document/chat', methods=['POST'])
@@ -364,96 +336,78 @@ def download_report(doc_id):
 def chat_with_document():
     data = request.get_json()
     if not data or 'message' not in data or 'document_id' not in data:
-        return jsonify({"message": "Missing message or document_id"}), 400
-        
+        return error_response("Missing message or document_id")
+
+
     doc_id = data['document_id']
     message = data['message']
     history = data.get('history', [])
     user_id = get_jwt_identity()
-    
-    db = SessionLocal()
+
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found or unauthorized"}), 404
-            
-        agent = FinancialIntelligenceAgent()
-        response_text = agent.run_chat_query(doc_id, message, history)
-        
-        return jsonify({
-            "success": True,
-            "response": response_text
-        }), 200
+        with session_scope(SessionLocal) as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found or unauthorized", 404)
+
+            agent = FinancialIntelligenceAgent()
+            response_text = agent.run_chat_query(doc_id, message, history)
+
+            return success_response(response=response_text)
     except Exception:
         logger.exception("Unexpected error while answering document chat request.")
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
-    finally:
-        db.close()
+        return internal_error()
 
 @doc_bp.route('/document/delete/<int:doc_id>', methods=['DELETE'])
 @jwt_required()
 def delete_document(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found or unauthorized"}), 404
-            
-        filename = doc.filename
-        file_path = doc.file_path
-        pdf_name = f"report_{doc_id}.pdf"
-        pdf_path = os.path.join(Config.REPORTS_FOLDER, pdf_name)
-        
-        # 1. Delete database records in MySQL
-        db.query(AnalysisHistory).filter(AnalysisHistory.document_id == doc_id).delete()
-        db.delete(doc)
-        db.commit()
-        
-        cleanup_failures = []
+        with session_scope(SessionLocal) as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found or unauthorized", 404)
 
-        # 2. Delete analysis from MongoDB
-        try:
-            mongo_db["analysis_results"].delete_one({"document_id": doc_id})
-        except Exception:
-            cleanup_failures.append("analysis record")
-            logger.exception("Failed to delete MongoDB analysis for document %s.", doc_id)
+            filename = doc.filename
+            file_path = doc.file_path
+            pdf_path = report_path(doc_id)
 
-        # 3. Delete physical files if they exist
-        if os.path.exists(file_path):
+            # 1. Delete database records in MySQL
+            db.query(AnalysisHistory).filter(AnalysisHistory.document_id == doc_id).delete()
+            db.delete(doc)
+            db.commit()
+
+            cleanup_failures = []
+
+            # 2. Delete analysis from MongoDB
             try:
-                os.remove(file_path)
-            except OSError:
-                cleanup_failures.append("uploaded file")
-                logger.warning("Failed to delete uploaded file %s.", file_path, exc_info=True)
-                
-        if os.path.exists(pdf_path):
+                mongo_db["analysis_results"].delete_one({"document_id": doc_id})
+            except Exception:
+                cleanup_failures.append("analysis record")
+                logger.exception("Failed to delete MongoDB analysis for document %s.", doc_id)
+
+            # 3. Delete physical files if they exist
+            for path, label in ((file_path, "uploaded file"), (pdf_path, "PDF report")):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        cleanup_failures.append(label)
+                        logger.warning("Failed to delete %s %s.", label, path, exc_info=True)
+
+            # 4. Remove document chunks from vector store
             try:
-                os.remove(pdf_path)
-            except OSError:
-                cleanup_failures.append("PDF report")
-                logger.warning("Failed to delete PDF report %s.", pdf_path, exc_info=True)
-                
-        # 4. Remove document chunks from vector store
-        try:
-            vstore = VectorStoreManager.get_instance()
-            vstore.remove_document_chunks(filename)
-        except Exception:
-            cleanup_failures.append("vector store chunks")
-            logger.exception("Failed to remove vector-store chunks for document %s.", doc_id)
-        
-        return jsonify({
-            "success": True,
-            "message": (
+                vstore = VectorStoreManager.get_instance()
+                vstore.remove_document_chunks(filename)
+            except Exception:
+                cleanup_failures.append("vector store chunks")
+                logger.exception("Failed to remove vector-store chunks for document %s.", doc_id)
+
+            return success_response(
                 "Document deleted successfully"
                 if not cleanup_failures
                 else f"Document deleted from the database, but cleanup failed for: {', '.join(cleanup_failures)}."
             )
-        }), 200
-        
     except Exception:
-        db.rollback()
         logger.exception("Unexpected error deleting document %s.", doc_id)
-        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
-    finally:
-        db.close()
+        return internal_error()
