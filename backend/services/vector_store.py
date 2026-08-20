@@ -58,7 +58,7 @@ class VectorStoreManager:
         if not chunks:
             return
         
-        if self.model is not None and not getattr(self, "keyword_only", False):
+        if self.model is not None and not self.keyword_only:
             try:
                 texts = [c["text"] for c in chunks]
                 embs = self.model.encode(texts, show_progress_bar=False)
@@ -95,7 +95,7 @@ class VectorStoreManager:
             self.model is not None
             and len(self.embeddings) > 0
             and embeddings_aligned
-            and not getattr(self, "keyword_only", False)
+            and not self.keyword_only
         ):
             try:
                 query_emb = self.model.encode([query], show_progress_bar=False)[0]

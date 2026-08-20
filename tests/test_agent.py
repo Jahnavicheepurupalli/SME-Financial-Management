@@ -130,7 +130,11 @@ def test_assemble_local_fallback_preserves_inputs(agent):
         },
         "charts": {"revenue_trend": [100]},
     }
-    result = agent._assemble_local_fallback(calculated, "source.csv")
+    result = agent._assemble_local_fallback(
+        calculated,
+        "source.csv",
+        "Test fallback reason.",
+    )
     assert set(result) == {
         "analysis_mode",
         "current_state_analysis",

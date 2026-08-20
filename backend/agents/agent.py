@@ -707,7 +707,7 @@ Document Context Chunks:
             "avg_monthly_revenue": round(revenue / 12, 2)
         }
 
-    def _assemble_local_fallback(self, calculated, filename, degraded_reason=None):
+    def _assemble_local_fallback(self, calculated, filename, degraded_reason):
         """Assembles a clean fallback JSON when Groq is unavailable."""
         metrics = calculated["metrics"]
         charts = calculated["charts"]
