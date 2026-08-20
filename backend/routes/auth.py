@@ -5,9 +5,6 @@ from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identi
 from flask_bcrypt import Bcrypt
 from backend.database.db import SessionLocal
 from backend.models.models import User
-from backend.logging_config import configure_logging
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint('auth', __name__)
@@ -227,6 +224,9 @@ def profile():
                 "full_name": user.full_name
             }
         }), 200
+    except Exception:
+        logger.exception("Unexpected error while loading the user profile.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 

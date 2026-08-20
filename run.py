@@ -57,7 +57,7 @@ if __name__ == "__main__":
             pass
         with child_exit_lock:
             exit_code = child_exit_code
-        sys.exit(exit_code or 1)
+        sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.info("Shutting down FinIntel SME servers...")
         sys.exit(0)

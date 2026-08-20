@@ -7,9 +7,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pymongo import MongoClient
 from backend.config import Config
-from backend.logging_config import configure_logging
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 # DB Paths

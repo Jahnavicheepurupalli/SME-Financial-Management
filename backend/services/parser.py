@@ -5,10 +5,8 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 from backend.exceptions import DocumentParseError
-from backend.logging_config import configure_logging
 import logging
 
-configure_logging()
 logger = logging.getLogger(__name__)
 
 class DocumentParser:
@@ -71,17 +69,16 @@ class DocumentParser:
             try:
                 chunks = DocumentParser.ocr_pdf(file_path)
             except DocumentParseError as e:
-                failures.append(("OCR", e))
-                if failures:
-                    strategy, cause = failures[-1]
-                    raise DocumentParseError(
-                        f"Unable to extract content from PDF using PyMuPDF, pdfplumber, or OCR: {e}"
-                    ) from cause
-                raise
-            if not chunks and failures:
-                strategy, cause = failures[-1]
+                logger.exception("All PDF extraction strategies failed for %s.", file_path)
                 raise DocumentParseError(
-                    f"Unable to extract content from PDF; {strategy} and fallback strategies failed."
+                    f"Unable to extract content from PDF using PyMuPDF, pdfplumber, or OCR: {e}",
+                    user_message=e.user_message
+                ) from e
+            if not chunks and failures:
+                _, cause = failures[-1]
+                raise DocumentParseError(
+                    "Unable to extract content from PDF; all extraction strategies returned no content.",
+                    user_message="The PDF could not be read or contains no extractable content."
                 ) from cause
 
         return chunks
@@ -101,7 +98,10 @@ class DocumentParser:
                         text = pytesseract.image_to_string(img_data)
                     except Exception as t_err:
                         raise DocumentParseError(
-                            f"OCR is unavailable or failed for scanned PDF page {page_num}: {t_err}"
+                            f"OCR is unavailable or failed for scanned PDF page {page_num}: {t_err}",
+                            user_message=(
+                                "This scanned PDF could not be read because OCR is unavailable or failed."
+                            )
                         ) from t_err
 
                     if text.strip():
@@ -114,7 +114,10 @@ class DocumentParser:
         except Exception as e:
             if isinstance(e, DocumentParseError):
                 raise
-            raise DocumentParseError(f"OCR failed for scanned PDF: {e}") from e
+            raise DocumentParseError(
+                f"OCR failed for scanned PDF: {e}",
+                user_message="This scanned PDF could not be read because OCR is unavailable or failed."
+            ) from e
         return chunks
 
     @staticmethod
@@ -127,7 +130,8 @@ class DocumentParser:
                 text = pytesseract.image_to_string(img)
             except Exception as t_err:
                 raise DocumentParseError(
-                    f"OCR is unavailable or failed for image {filename}: {t_err}"
+                    f"OCR is unavailable or failed for image {filename}: {t_err}",
+                    user_message="This image could not be read because OCR is unavailable or failed."
                 ) from t_err
                 
             return [{
@@ -139,7 +143,10 @@ class DocumentParser:
         except DocumentParseError:
             raise
         except Exception as e:
-            raise DocumentParseError(f"Unable to parse image {filename}: {e}") from e
+            raise DocumentParseError(
+                f"Unable to parse image {filename}: {e}",
+                user_message="The image could not be read; it may be corrupt or unsupported."
+            ) from e
 
     @staticmethod
     def parse_csv(file_path):
@@ -168,7 +175,10 @@ class DocumentParser:
                     "type": "csv_data"
                 })
         except Exception as e:
-            raise DocumentParseError(f"Unable to parse CSV {filename}: {e}") from e
+            raise DocumentParseError(
+                f"Unable to parse CSV {filename}: {e}",
+                user_message="The CSV file could not be read; it may be corrupt or unsupported."
+            ) from e
         return chunks
 
     @staticmethod
@@ -194,7 +204,10 @@ class DocumentParser:
                         "type": "excel_data"
                     })
         except Exception as e:
-            raise DocumentParseError(f"Unable to parse Excel {filename}: {e}") from e
+            raise DocumentParseError(
+                f"Unable to parse Excel {filename}: {e}",
+                user_message="The Excel file could not be read; it may be corrupt or unsupported."
+            ) from e
         return chunks
 
     @staticmethod

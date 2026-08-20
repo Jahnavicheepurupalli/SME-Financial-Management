@@ -1,8 +1,5 @@
 import numpy as np
 import logging
-from backend.logging_config import configure_logging
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 try:

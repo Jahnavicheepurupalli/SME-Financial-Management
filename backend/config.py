@@ -1,11 +1,9 @@
 import os
 import logging
 from dotenv import load_dotenv
-from backend.logging_config import configure_logging
 
 # Load environment variables
 load_dotenv()
-configure_logging()
 logger = logging.getLogger(__name__)
 
 class Config:

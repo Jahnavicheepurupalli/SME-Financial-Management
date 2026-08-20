@@ -10,9 +10,6 @@ from backend.services.parser import DocumentParser
 from backend.services.vector_store import VectorStoreManager
 from backend.agents.agent import FinancialIntelligenceAgent
 from backend.exceptions import AnalysisStorageError, DocumentParseError
-from backend.logging_config import configure_logging
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 doc_bp = Blueprint('document', __name__)
@@ -80,7 +77,10 @@ def check_is_financial_file(file_path, file_type):
     except Exception as e:
         logger.exception("Unable to inspect uploaded file %s during validation.", file_path)
         raise DocumentParseError(
-            f"Unable to read the uploaded {file_type.lower()} file; it may be corrupt or unreadable."
+            f"Unable to read uploaded {file_type.lower()} file: {e}",
+            user_message=(
+                f"The uploaded {file_type.lower()} file could not be read; it may be corrupt or unreadable."
+            )
         ) from e
 
     if not text or not text.strip():
@@ -184,11 +184,12 @@ def upload_file():
     try:
         is_financial_file = check_is_financial_file(file_path, file_type)
     except DocumentParseError as e:
+        logger.warning("Uploaded file failed content validation: %s", e, exc_info=True)
         try:
             os.remove(file_path)
         except OSError:
             logger.warning("Unable to remove unreadable upload %s.", file_path, exc_info=True)
-        return jsonify({"message": str(e)}), 422
+        return jsonify({"message": e.user_message}), 422
 
     if not is_financial_file:
         if os.path.exists(file_path):
@@ -261,11 +262,11 @@ def upload_file():
 
     except DocumentParseError as e:
         db.rollback()
-        logger.warning("Document %s could not be parsed: %s", filename, e)
+        logger.warning("Document %s could not be parsed: %s", filename, e, exc_info=True)
         if doc_record:
             _mark_document_failed(doc_record.id)
         _remove_file(file_path)
-        return jsonify({"message": str(e)}), 422
+        return jsonify({"message": e.user_message}), 422
     except AnalysisStorageError:
         db.rollback()
         logger.exception("Analysis for document %s could not be saved.", filename)
@@ -299,6 +300,9 @@ def get_history():
                 "created_at": doc.created_at.isoformat()
             })
         return jsonify({"history": history_list}), 200
+    except Exception:
+        logger.exception("Unexpected error while loading document history.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -320,6 +324,9 @@ def get_history_detail(doc_id):
             result['_id'] = str(result['_id'])
             
         return jsonify({"analysis": result, "filename": doc.filename}), 200
+    except Exception:
+        logger.exception("Unexpected error while loading analysis details for document %s.", doc_id)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -345,6 +352,9 @@ def download_report(doc_id):
             as_attachment=True,
             download_name=f"Financial_Analysis_{doc.filename}.pdf"
         )
+    except Exception:
+        logger.exception("Unexpected error while downloading report for document %s.", doc_id)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 

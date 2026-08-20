@@ -12,9 +12,6 @@ from backend.database.db import mongo_db, SessionLocal
 from backend.models.models import Document, AnalysisHistory
 from backend.services.pdf_generator import PDFReportGenerator
 from backend.exceptions import AnalysisStorageError
-from backend.logging_config import configure_logging
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 # List of allowed topics for chatbot
@@ -361,21 +358,22 @@ Document Context:
             content = content.strip()
             
             parsed_json = json.loads(content)
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "Groq analysis invocation or response parsing failed for document %s; "
                 "using local rule-based fallback.",
                 document_id
             )
+            fallback_reason = "AI analysis was unavailable; local rule-based analysis was used."
             fallback_json = self._assemble_local_fallback(
-                calculated_metrics, filename, f"AI analysis unavailable: {e}"
+                calculated_metrics, filename, fallback_reason
             )
             try:
                 _generate_pdf(document_id, fallback_json)
                 _store_analysis_in_mongo(
                     document_id,
                     fallback_json,
-                    f"Local rule-based fallback executed: {e}"
+                    "Local rule-based fallback analysis was used because AI analysis was unavailable."
                 )
                 _update_mysql_storage(document_id, "analyzed")
             except AnalysisStorageError:

@@ -17,11 +17,11 @@ if _user_site and _user_site not in sys.path:
 from flask import Flask
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
+from backend.logging_config import configure_logging
 from backend.config import Config
 from backend.database.db import engine, Base
 from backend.routes.auth import auth_bp
 from backend.routes.document import doc_bp
-from backend.logging_config import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
