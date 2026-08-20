@@ -65,20 +65,33 @@ def _headers(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_upload_validation_and_happy_path(client, auth_token, monkeypatch, session_factory, tmp_path):
+def test_upload_requires_file_part(client, auth_token):
     assert client.post("/api/upload", headers=_headers(auth_token)).status_code == 400
+
+
+def test_upload_rejects_empty_filename(client, auth_token):
     assert client.post("/api/upload", data={"file": (io.BytesIO(b"x"), "")}, headers=_headers(auth_token), content_type="multipart/form-data").status_code == 400
+
+
+def test_upload_rejects_disallowed_extension(client, auth_token):
     assert client.post("/api/upload", data={"file": (io.BytesIO(b"x"), "x.txt")}, headers=_headers(auth_token), content_type="multipart/form-data").status_code == 400
+
+
+def test_upload_rejects_oversized_file(client, auth_token, monkeypatch):
     real_getsize = document_module.os.path.getsize
     monkeypatch.setattr(document_module.os.path, "getsize", lambda path: 11 * 1024 * 1024)
     assert client.post("/api/upload", data={"file": (io.BytesIO(b"revenue,assets\n1,2"), "large.csv")}, headers=_headers(auth_token), content_type="multipart/form-data").status_code == 400
     monkeypatch.setattr(document_module.os.path, "getsize", real_getsize)
 
+
+def test_upload_rejects_non_financial_content(client, auth_token, monkeypatch, tmp_path):
     monkeypatch.setattr(document_module, "check_is_financial_file", lambda *args: False)
     response = client.post("/api/upload", data={"file": (io.BytesIO(b"resume"), "resume.csv")}, headers=_headers(auth_token), content_type="multipart/form-data")
     assert response.status_code == 400
     assert not (tmp_path / "uploads" / "resume.csv").exists()
 
+
+def test_upload_happy_path_persists_document(client, auth_token, monkeypatch, session_factory):
     monkeypatch.setattr(document_module, "check_is_financial_file", lambda *args: True)
     monkeypatch.setattr(document_module.DocumentParser, "parse_csv", lambda path: [{"text": "revenue", "source_doc": "good.csv", "page_num": 1}])
     monkeypatch.setattr(document_module.VectorStoreManager, "get_instance", lambda: SimpleNamespace(clear=lambda: None, add_chunks=lambda chunks: None))

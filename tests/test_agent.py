@@ -179,7 +179,6 @@ def test_run_chat_query_fallbacks(monkeypatch, agent, query, expected):
     monkeypatch.setattr(agent_module, "mongo_db", Mongo())
     agent.llm = SimpleNamespace(invoke=lambda messages: (_ for _ in ()).throw(RuntimeError("offline")))
     assert expected in agent.run_chat_query(1, query, [])
-    monkeypatch.setattr(agent_module, "mongo_db", SimpleNamespace(__getitem__=lambda self, name: Results()))
 
 
 def test_run_chat_query_generic_offline(monkeypatch, agent):
@@ -192,39 +191,72 @@ def test_run_chat_query_generic_offline(monkeypatch, agent):
     assert "currently offline" in agent.run_chat_query(1, "liquidity", [])
 
 
-def test_agent_tools(monkeypatch):
+def _tool_db(monkeypatch, document=None):
+    doc = document or SimpleNamespace(filename="file.pdf", id=1, user_id=2, status="old")
+    query = SimpleNamespace(first=lambda: doc)
+    db = SimpleNamespace(
+        query=lambda *args: SimpleNamespace(filter=lambda *a: query),
+        close=lambda: None,
+        add=lambda obj: None,
+        commit=lambda: None,
+    )
+    monkeypatch.setattr(agent_module, "SessionLocal", lambda: db)
+    return doc, query, db
+
+
+def test_document_reader_tool_returns_chunks(monkeypatch):
     monkeypatch.setattr(agent_module.VectorStoreManager, "get_instance", lambda: SimpleNamespace(
         similarity_search=lambda query, k: [{"chunk": {"source_doc": "a.pdf", "page_num": 1, "text": "hello"}}]
     ))
     assert "SOURCE: a.pdf" in document_reader_tool.func("hello")
+
+
+def test_document_reader_tool_empty_results(monkeypatch):
     monkeypatch.setattr(agent_module.VectorStoreManager, "get_instance", lambda: SimpleNamespace(similarity_search=lambda *a, **k: []))
     assert "No relevant" in document_reader_tool.func("none")
 
-    doc = SimpleNamespace(filename="file.pdf", id=1, user_id=2, status="old")
-    query = SimpleNamespace(first=lambda: doc)
-    db = SimpleNamespace(query=lambda *args: SimpleNamespace(filter=lambda *a: query), close=lambda: None)
-    monkeypatch.setattr(agent_module, "SessionLocal", lambda: db)
+
+def test_pdf_generator_tool_success(monkeypatch):
+    _tool_db(monkeypatch)
     generated = []
     monkeypatch.setattr(agent_module.PDFReportGenerator, "generate", lambda path, name, data: generated.append((path, name, data)))
     assert pdf_generator_tool.func(1, '{"x": 1}').endswith("report_1.pdf")
     assert generated
+
+
+def test_pdf_generator_tool_document_not_found(monkeypatch):
+    _, query, _ = _tool_db(monkeypatch)
     query.first = lambda: None
     assert "not found" in pdf_generator_tool.func(1, "{}")
-    query.first = lambda: doc
+
+
+def test_pdf_generator_tool_bad_json(monkeypatch):
+    _tool_db(monkeypatch)
+    monkeypatch.setattr(agent_module.PDFReportGenerator, "generate", lambda *args: None)
     assert "Error generating PDF" in pdf_generator_tool.func(1, "{bad")
 
+
+def test_mongo_storage_tool_success(monkeypatch):
     stored = []
     class Collection:
         def replace_one(self, *args, **kwargs):
             stored.append(args)
     monkeypatch.setattr(agent_module, "mongo_db", {"analysis_results": Collection()})
     assert mongo_storage_tool.func(1, "{}", "log").startswith("Successfully")
+
+
+def test_mongo_storage_tool_bad_json(monkeypatch):
+    monkeypatch.setattr(agent_module, "mongo_db", {"analysis_results": SimpleNamespace(replace_one=lambda *args, **kwargs: None)})
     assert "Error saving" in mongo_storage_tool.func(1, "{bad", "log")
 
-    query.first = lambda: doc
-    db.add = lambda obj: None
-    db.commit = lambda: None
+
+def test_mysql_storage_tool_success(monkeypatch):
+    _, _, _ = _tool_db(monkeypatch)
     assert "Successfully updated" in mysql_storage_tool.func(1, "analyzed")
+
+
+def test_mysql_storage_tool_document_not_found(monkeypatch):
+    _, query, _ = _tool_db(monkeypatch)
     query.first = lambda: None
     assert "not found" in mysql_storage_tool.func(1, "analyzed")
 
@@ -244,3 +276,90 @@ def test_agent_init_and_mysql_error(monkeypatch):
             pass
     monkeypatch.setattr(agent_module, "SessionLocal", lambda: BrokenDB())
     assert "Error updating MySQL" in mysql_storage_tool.func(1, "analyzed")
+
+
+def _pipeline_fakes(monkeypatch, agent, llm):
+    calls = {"pdf": [], "mongo": [], "mysql": []}
+    doc = SimpleNamespace(filename="ledger.csv", file_path="/tmp/ledger.csv")
+
+    class Query:
+        def filter(self, *args):
+            return self
+
+        def first(self):
+            return doc
+
+    class DB:
+        def query(self, *args):
+            return Query()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_module, "SessionLocal", lambda: DB())
+    monkeypatch.setattr(
+        agent_module.VectorStoreManager,
+        "get_instance",
+        lambda: SimpleNamespace(chunks=[{"source_doc": "ledger.csv", "page_num": 1, "text": "revenue 100"}]),
+    )
+    calculated = {
+        "metrics": {"total_revenue": 100, "total_expense": 20, "net_profit": 80, "profit_margin": 80,
+                    "operating_margin": 68, "cash_flow": 80, "current_ratio": 2, "debt_ratio": 0.2},
+        "charts": {"revenue_trend": [100], "expense_trend": [20]},
+    }
+    monkeypatch.setattr(agent, "_calculate_metrics_directly", lambda *args: calculated)
+    monkeypatch.setattr(agent_module, "pdf_generator_tool", SimpleNamespace(
+        func=lambda document_id, payload: calls["pdf"].append((document_id, payload)) or "pdf"
+    ))
+    monkeypatch.setattr(agent_module, "mongo_storage_tool", SimpleNamespace(
+        func=lambda document_id, payload, reasoning: calls["mongo"].append((document_id, payload, reasoning)) or "mongo"
+    ))
+    monkeypatch.setattr(agent_module, "mysql_storage_tool", SimpleNamespace(
+        func=lambda document_id, status: calls["mysql"].append((document_id, status)) or "mysql"
+    ))
+    agent.llm = llm
+    return calls, calculated
+
+
+def test_run_analysis_happy_path_strips_fences_and_overwrites_llm_values(monkeypatch, agent):
+    llm_json = {
+        "current_state_analysis": {"revenue_trend": "LLM text"},
+        "gap_detection": [],
+        "forward_looking_flags": [],
+        "missing_data_detection": [],
+        "metrics": {"total_revenue": 999999},
+        "charts": {"revenue_trend": [999999]},
+    }
+    calls, calculated = _pipeline_fakes(
+        monkeypatch,
+        agent,
+        SimpleNamespace(invoke=lambda messages: SimpleNamespace(content=f"```json\n{json.dumps(llm_json)}\n```")),
+    )
+    result = agent.run_analysis(7)
+    assert result["metrics"] is calculated["metrics"]
+    assert result["charts"] is calculated["charts"]
+    assert result["current_state_analysis"]["revenue_trend"] == "LLM text"
+    assert calls["pdf"][0][0] == 7
+    assert calls["mongo"][0][0] == 7
+    assert calls["mysql"] == [(7, "processing"), (7, "analyzed")]
+
+
+def test_run_analysis_fallback_runs_side_effects_and_records_reasoning(monkeypatch, agent):
+    calls, _ = _pipeline_fakes(
+        monkeypatch,
+        agent,
+        SimpleNamespace(invoke=lambda messages: (_ for _ in ()).throw(RuntimeError("LLM offline"))),
+    )
+    result = agent.run_analysis(8)
+    assert set(result) == {
+        "current_state_analysis",
+        "gap_detection",
+        "forward_looking_flags",
+        "missing_data_detection",
+        "metrics",
+        "charts",
+    }
+    assert calls["pdf"][0][0] == 8
+    assert calls["mongo"][0][0] == 8
+    assert "LLM offline" in calls["mongo"][0][2]
+    assert calls["mysql"] == [(8, "processing"), (8, "analyzed")]
