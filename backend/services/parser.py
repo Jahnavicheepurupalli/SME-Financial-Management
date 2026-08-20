@@ -1,12 +1,14 @@
 import os
-import csv
 import pandas as pd
 import pdfplumber
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
-
+from backend.exceptions import DocumentParseError
 from backend.utils.chunks import make_chunk
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DocumentParser:
     @staticmethod
@@ -14,18 +16,19 @@ class DocumentParser:
         """Extracts text and tables from PDF page-by-page."""
         chunks = []
         filename = os.path.basename(file_path)
+        failures = []
         
         try:
             # First try PyMuPDF for quick text extraction
-            doc = fitz.open(file_path)
-            for page_idx, page in enumerate(doc):
-                page_num = page_idx + 1
-                text = page.get_text()
-                if text.strip():
-                    chunks.append(make_chunk(text, page_num, filename, "text"))
-            doc.close()
+            with fitz.open(file_path) as doc:
+                for page_idx, page in enumerate(doc):
+                    page_num = page_idx + 1
+                    text = page.get_text()
+                    if text.strip():
+                        chunks.append(make_chunk(text, page_num, filename, "text"))
         except Exception as e:
-            print(f"PyMuPDF error: {e}")
+            failures.append(("PyMuPDF", e))
+            logger.warning("PyMuPDF extraction failed for %s; trying fallback.", file_path, exc_info=True)
 
         # If no text extracted, or to capture structured tables, use pdfplumber
         if not chunks:
@@ -36,7 +39,7 @@ class DocumentParser:
                         text = page.extract_text()
                         if text and text.strip():
                             chunks.append(make_chunk(text, page_num, filename, "text"))
-                            
+
                         # Extract tables
                         tables = page.extract_tables()
                         for table in tables:
@@ -44,11 +47,25 @@ class DocumentParser:
                             if table_str:
                                 chunks.append(make_chunk(table_str, page_num, filename, "table"))
             except Exception as e:
-                print(f"pdfplumber error: {e}")
+                failures.append(("pdfplumber", e))
+                logger.warning("pdfplumber extraction failed for %s; trying OCR.", file_path, exc_info=True)
                 
         # If still empty, it might be a scanned PDF. Let's try OCR.
         if not chunks:
-            chunks = DocumentParser.ocr_pdf(file_path)
+            try:
+                chunks = DocumentParser.ocr_pdf(file_path)
+            except DocumentParseError as e:
+                logger.exception("All PDF extraction strategies failed for %s.", file_path)
+                raise DocumentParseError(
+                    f"Unable to extract content from PDF using PyMuPDF, pdfplumber, or OCR: {e}",
+                    user_message=e.user_message
+                ) from e
+            if not chunks and failures:
+                _, cause = failures[-1]
+                raise DocumentParseError(
+                    "Unable to extract content from PDF; all extraction strategies returned no content.",
+                    user_message="The PDF could not be read or contains no extractable content."
+                ) from cause
 
         return chunks
 
@@ -58,23 +75,30 @@ class DocumentParser:
         chunks = []
         filename = os.path.basename(file_path)
         try:
-            doc = fitz.open(file_path)
-            for page_idx, page in enumerate(doc):
-                page_num = page_idx + 1
-                pix = page.get_pixmap()
-                img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                
-                try:
-                    text = pytesseract.image_to_string(img_data)
-                except Exception as t_err:
-                    print(f"Tesseract not configured or missing: {t_err}. Mocking text from scan.")
-                    text = f"[Scanned Page {page_num}] Unable to run full OCR because Tesseract binary is not installed on system."
-                
-                if text.strip():
-                    chunks.append(make_chunk(text, page_num, filename, "ocr_text"))
-            doc.close()
+            with fitz.open(file_path) as doc:
+                for page_idx, page in enumerate(doc):
+                    page_num = page_idx + 1
+                    pix = page.get_pixmap()
+                    img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    try:
+                        text = pytesseract.image_to_string(img_data)
+                    except Exception as t_err:
+                        raise DocumentParseError(
+                            f"OCR is unavailable or failed for scanned PDF page {page_num}: {t_err}",
+                            user_message=(
+                                "This scanned PDF could not be read because OCR is unavailable or failed."
+                            )
+                        ) from t_err
+
+                    if text.strip():
+                        chunks.append(make_chunk(text, page_num, filename, "ocr_text"))
         except Exception as e:
-            print(f"OCR PDF error: {e}")
+            if isinstance(e, DocumentParseError):
+                raise
+            raise DocumentParseError(
+                f"OCR failed for scanned PDF: {e}",
+                user_message="This scanned PDF could not be read because OCR is unavailable or failed."
+            ) from e
         return chunks
 
     @staticmethod
@@ -86,13 +110,19 @@ class DocumentParser:
             try:
                 text = pytesseract.image_to_string(img)
             except Exception as t_err:
-                print(f"Tesseract missing: {t_err}")
-                text = f"[Scanned Image] Tesseract OCR not available to parse {filename}."
+                raise DocumentParseError(
+                    f"OCR is unavailable or failed for image {filename}: {t_err}",
+                    user_message="This image could not be read because OCR is unavailable or failed."
+                ) from t_err
                 
             return [make_chunk(text, 1, filename, "ocr_text")]
+        except DocumentParseError:
+            raise
         except Exception as e:
-            print(f"Parse Image error: {e}")
-            return []
+            raise DocumentParseError(
+                f"Unable to parse image {filename}: {e}",
+                user_message="The image could not be read; it may be corrupt or unsupported."
+            ) from e
 
     @staticmethod
     def parse_csv(file_path):
@@ -105,16 +135,19 @@ class DocumentParser:
             if len(df) > 500:
                 df = df.head(500)
                 
-            # Chunk rows in batches to avoid blowing token limit
+            # Chunk rows in batches of 50 rows to avoid blowing token limit
             chunks = DocumentParser._chunk_rows(
                 df.values.tolist(),
                 filename,
                 "csv_data",
-                label="Financial CSV Dataset Chunk",
+                "Financial CSV Dataset Chunk",
                 header_row=df.columns.tolist()
             )
         except Exception as e:
-            print(f"CSV Parse error: {e}")
+            raise DocumentParseError(
+                f"Unable to parse CSV {filename}: {e}",
+                user_message="The CSV file could not be read; it may be corrupt or unsupported."
+            ) from e
         return chunks
 
     @staticmethod
@@ -128,20 +161,23 @@ class DocumentParser:
                 df = pd.read_excel(xls, sheet_name=sheet_name)
                 # Convert dataframe to table style representation
                 table_list = [df.columns.tolist()] + df.values.tolist()
-                
+
                 chunks.extend(DocumentParser._chunk_rows(
                     table_list,
                     filename,
                     "excel_data",
-                    label=f"Excel Sheet: {sheet_name} Chunk"
+                    f"Excel Sheet: {sheet_name} Chunk"
                 ))
         except Exception as e:
-            print(f"Excel Parse error: {e}")
+            raise DocumentParseError(
+                f"Unable to parse Excel {filename}: {e}",
+                user_message="The Excel file could not be read; it may be corrupt or unsupported."
+            ) from e
         return chunks
 
     @staticmethod
     def _chunk_rows(rows, filename, chunk_type, label, header_row=None, batch_size=50):
-        """Batches tabular rows into token-sized text chunks, prefixing the header row."""
+        """Splits tabular rows into batched chunks, optionally repeating a header row."""
         chunks = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i:i + batch_size]

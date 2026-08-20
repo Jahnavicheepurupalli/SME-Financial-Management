@@ -15,7 +15,7 @@ def to_float(value, default=0.0):
 
 
 def safe_ratio(numerator, denominator, default, digits=2):
-    """Divides two values, falling back to `default` when the denominator is unusable."""
-    if not denominator:
+    """Divides two values, falling back to `default` unless the denominator is positive."""
+    if not denominator or denominator <= 0:
         return default
     return round(numerator / denominator, digits)

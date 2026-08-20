@@ -178,6 +178,7 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [activeTab, setActiveTab] = useState('csa'); // 'csa', 'gaps', 'missing', 'flags', 'chat'
+  const [dashboardError, setDashboardError] = useState('');
   
   // Chat state
   const [chatMessage, setChatMessage] = useState('');
@@ -186,6 +187,20 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
   const chatBottomRef = useRef(null);
 
   const navigate = useNavigate();
+
+  const getServerErrorMessage = async (err, fallback) => {
+    const responseData = err.response?.data;
+    if (responseData?.message) return responseData.message;
+    if (responseData instanceof Blob) {
+      try {
+        const parsed = JSON.parse(await responseData.text());
+        if (parsed.message) return parsed.message;
+      } catch {
+        // Keep the original client error when the response is not JSON.
+      }
+    }
+    return err.message || fallback;
+  };
 
   // Load User and Upload History
   useEffect(() => {
@@ -206,6 +221,7 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
   const fetchHistory = async (targetDocId = null) => {
     try {
       const response = await api.get('/history');
+      setDashboardError('');
       const history = response.data.history;
       setFilesHistory(history);
       
@@ -238,6 +254,7 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
       }
     } catch (err) {
       console.error('Failed to fetch history', err);
+      setDashboardError(err.response?.data?.message || err.message || 'Unable to load document history.');
     }
   };
 
@@ -250,6 +267,7 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
       setChatHistory([]); // Clear chat session when loading history item
     } catch (err) {
       console.error('Failed to load analysis details', err);
+      setDashboardError(err.response?.data?.message || err.message || 'Unable to load analysis details.');
     }
   };
 
@@ -353,7 +371,7 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
       link.click();
       document.body.removeChild(link);
     } catch (err) {
-      alert('Failed to download PDF report. Ensure report is generated.');
+      alert(`Failed to download PDF report: ${await getServerErrorMessage(err, 'Ensure the report is generated.')}`);
     }
   };
 
@@ -376,9 +394,10 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
       setChatHistory((prev) => [...prev, { role: 'assistant', content: response.data.response }]);
     } catch (err) {
       console.error(err);
+      const errorMessage = err.response?.data?.message || err.message || 'Unable to complete the chat request.';
       setChatHistory((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Connection timed out or network error. Please try again.' }
+        { role: 'assistant', content: errorMessage }
       ]);
     } finally {
       setIsChatLoading(false);
@@ -454,6 +473,20 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
             FinIntel Agent Online
           </div>
         </div>
+
+        {dashboardError && (
+          <div role="alert" className="flex items-start justify-between gap-4 rounded-xl border border-rose-200 bg-rose-500/10 px-4 py-3 text-xs text-rose-700 dark:border-rose-900/60 dark:text-rose-300">
+            <span>{dashboardError}</span>
+            <button
+              type="button"
+              onClick={() => setDashboardError('')}
+              className="shrink-0 text-rose-500 hover:text-rose-700 dark:hover:text-rose-200"
+              aria-label="Dismiss error"
+            >
+              <Lucide.X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
 
         <div className="grid lg:grid-cols-4 gap-6">
           
@@ -593,6 +626,12 @@ export default function Dashboard({ darkMode, toggleDarkMode }) {
               </div>
             ) : (
               <div className="space-y-6">
+                {activeAnalysis.analysis_mode === 'local_fallback' && (
+                  <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:border-amber-900/60 dark:text-amber-300">
+                    <Lucide.Info className="h-4 w-4 shrink-0" />
+                    <span>AI analysis was unavailable. Figures and observations come from the local rule-based engine.</span>
+                  </div>
+                )}
                 
                 {/* 12 CORE FINANCIAL METRICS CARDS */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
