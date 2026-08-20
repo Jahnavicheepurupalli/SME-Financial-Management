@@ -1,11 +1,16 @@
 import json
 import os
+import logging
+import tempfile
 import pymysql
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from backend.config import Config
+from backend.logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 # DB Paths
 SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sme_financials.db")
@@ -18,7 +23,10 @@ is_sqlite = False
 
 # Try connecting to MySQL
 try:
-    print(f"Attempting to verify/create MySQL database '{Config.MYSQL_DB}' at {Config.MYSQL_HOST}:{Config.MYSQL_PORT}...")
+    logger.info(
+        "Attempting to verify/create MySQL database '%s' at %s:%s...",
+        Config.MYSQL_DB, Config.MYSQL_HOST, Config.MYSQL_PORT
+    )
     conn = pymysql.connect(
         host=Config.MYSQL_HOST,
         port=Config.MYSQL_PORT,
@@ -31,12 +39,16 @@ try:
     conn.commit()
     cursor.close()
     conn.close()
-    
-    print("MySQL connection successful. Initializing MySQL engine...")
+
+    logger.info("MySQL connection successful. Initializing MySQL engine...")
     engine = create_engine(MYSQL_DATABASE_URI, pool_recycle=3600, pool_pre_ping=True)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-except Exception as e:
-    print(f"MySQL connection failed: {e}. Falling back to local SQLite database at {SQLITE_DB_PATH}")
+except Exception:
+    logger.warning(
+        "MySQL connection failed. Falling back to local SQLite database at %s.",
+        SQLITE_DB_PATH,
+        exc_info=True
+    )
     engine = create_engine(SQLITE_DATABASE_URI, connect_args={"check_same_thread": False})
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     is_sqlite = True
@@ -59,13 +71,31 @@ class MockMongoCollection:
         self._ensure_file()
         try:
             with open(self.db_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
+                contents = f.read()
+            if not contents.strip():
+                return {}
+            return json.loads(contents)
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Unable to read mock MongoDB store at %s.", self.db_path)
+            raise
 
     def _write_data(self, data):
-        with open(self.db_path, 'w') as f:
-            json.dump(data, f, indent=2)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=os.path.dirname(self.db_path),
+                prefix='.mock_mongodb-', suffix='.tmp', delete=False
+            ) as f:
+                temp_path = f.name
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.db_path)
+        except Exception:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            logger.exception("Unable to write mock MongoDB store at %s.", self.db_path)
+            raise
 
     def insert_one(self, document):
         data = self._read_data()
@@ -212,20 +242,23 @@ is_mock_mongo = False
 
 mock_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_mongodb.json")
 
-print("Checking MongoDB service availability...")
+logger.info("Checking MongoDB service availability...")
 if is_mongo_port_open(Config.MONGO_URI):
     try:
-        print("MongoDB port is open. Initializing MongoClient...")
+        logger.info("MongoDB port is open. Initializing MongoClient...")
         mongo_client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=1000)
         mongo_client.server_info()
         mongo_db = mongo_client["sme_financials"]
-        print("Successfully connected to MongoDB.")
-    except Exception as e:
-        print(f"MongoDB connection failed on handshake: {e}. Falling back to file-based database.")
+        logger.info("Successfully connected to MongoDB.")
+    except Exception:
+        logger.warning(
+            "MongoDB connection failed on handshake. Falling back to file-based database.",
+            exc_info=True
+        )
         mongo_db = MockMongoDB(mock_db_path)
         is_mock_mongo = True
 else:
-    print("MongoDB port is closed. Falling back to file-based database instantly.")
+    logger.warning("MongoDB port is closed. Falling back to file-based database instantly.")
     mongo_db = MockMongoDB(mock_db_path)
     is_mock_mongo = True
 

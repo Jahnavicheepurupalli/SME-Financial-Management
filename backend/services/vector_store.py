@@ -1,5 +1,9 @@
 import numpy as np
-import os
+import logging
+from backend.logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -20,22 +24,27 @@ class VectorStoreManager:
         self.model = None
         self.chunks = []
         self.embeddings = []
+        self.keyword_only = False
         
         if HAS_SENTENCE_TRANSFORMER:
             try:
                 # Using a fast, free local transformer model
-                print("Loading local SentenceTransformer model (all-MiniLM-L6-v2)...")
+                logger.info("Loading local SentenceTransformer model (all-MiniLM-L6-v2)...")
                 # Add a local download timeout/retry wrapper
                 self.model = SentenceTransformer('all-MiniLM-L6-v2')
-                print("SentenceTransformer loaded.")
-            except Exception as e:
-                print(f"Warning: SentenceTransformer failed to load: {e}. Running with keyword search fallback.")
+                logger.info("SentenceTransformer loaded.")
+            except Exception:
+                logger.warning(
+                    "SentenceTransformer failed to load. Running with keyword search fallback.",
+                    exc_info=True
+                )
         else:
-            print("SentenceTransformer library not found. Running with keyword search fallback.")
+            logger.warning("SentenceTransformer library not found. Running with keyword search fallback.")
         
     def clear(self):
         self.chunks = []
         self.embeddings = []
+        self.keyword_only = False
 
     def remove_document_chunks(self, filename):
         """Removes chunks belonging to a specific file and re-encodes the rest."""
@@ -52,26 +61,40 @@ class VectorStoreManager:
         if not chunks:
             return
         
-        self.chunks.extend(chunks)
-        
-        if self.model is not None:
+        if self.model is not None and not self.keyword_only:
             try:
                 texts = [c["text"] for c in chunks]
                 embs = self.model.encode(texts, show_progress_bar=False)
                 
-                if len(self.embeddings) == 0:
-                    self.embeddings = np.array(embs)
+                if len(self.embeddings) == 0 and not self.chunks:
+                    new_embeddings = np.array(embs)
+                elif len(self.embeddings) == len(self.chunks):
+                    new_embeddings = np.vstack([self.embeddings, embs])
                 else:
-                    self.embeddings = np.vstack([self.embeddings, embs])
-            except Exception as e:
-                print(f"Warning: Failed to compute embeddings: {e}. Chunks will be indexed with keyword search.")
+                    logger.warning("Embedding index was already inconsistent; switching to keyword search.")
+                    self.keyword_only = True
+                    self.embeddings = []
+                    self.chunks.extend(chunks)
+                    return
+                self.chunks.extend(chunks)
+                self.embeddings = new_embeddings
+            except Exception:
+                self.chunks.extend(chunks)
+                self.embeddings = []
+                self.keyword_only = True
+                logger.exception(
+                    "Failed to compute embeddings; switching to keyword search for all indexed chunks."
+                )
+        else:
+            self.chunks.extend(chunks)
             
     def similarity_search(self, query, k=8):
         """Finds top-k matching chunks."""
         if not self.chunks:
             return []
             
-        if self.model is not None and len(self.embeddings) > 0:
+        embeddings_aligned = len(self.embeddings) == len(self.chunks)
+        if self.model is not None and len(self.embeddings) > 0 and embeddings_aligned and not self.keyword_only:
             try:
                 query_emb = self.model.encode([query], show_progress_bar=False)[0]
                 
@@ -95,8 +118,10 @@ class VectorStoreManager:
                         "score": float(scores[idx])
                     })
                 return results
-            except Exception as e:
-                print(f"Warning: Cosine similarity search failed: {e}. Falling back to keyword matching.")
+            except Exception:
+                logger.warning("Cosine similarity search failed; falling back to keyword matching.", exc_info=True)
+        elif self.model is not None and len(self.embeddings) != len(self.chunks):
+            logger.warning("Embedding index is out of sync with chunks; using keyword search.")
 
         # Resilient keyword word-overlap matching
         query_words = set(re_tokenize(query.lower()))

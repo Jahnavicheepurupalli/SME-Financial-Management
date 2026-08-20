@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 
 # Ensure the project root is on sys.path so that `from backend.xxx import ...`
 # works whether this file is run directly (python backend/app.py) or as a module
@@ -20,14 +21,19 @@ from backend.config import Config
 from backend.database.db import engine, Base
 from backend.routes.auth import auth_bp
 from backend.routes.document import doc_bp
+from backend.logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 # Initialize database schemas
 try:
-    print("Creating MySQL tables...")
+    logger.info("Creating database tables...")
     Base.metadata.create_all(bind=engine)
-    print("MySQL tables created/verified.")
-except Exception as e:
-    print(f"Warning: Could not create tables automatically: {e}")
+    logger.info("Database tables created/verified.")
+except Exception:
+    logger.exception("Could not create database tables during startup; aborting.")
+    raise
 
 # Validate Google OAuth credentials on startup
 Config.validate_oauth_config()

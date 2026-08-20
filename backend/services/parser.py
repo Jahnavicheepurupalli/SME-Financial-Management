@@ -1,10 +1,15 @@
 import os
-import csv
 import pandas as pd
 import pdfplumber
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
+from backend.exceptions import DocumentParseError
+from backend.logging_config import configure_logging
+import logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 class DocumentParser:
     @staticmethod
@@ -12,23 +17,24 @@ class DocumentParser:
         """Extracts text and tables from PDF page-by-page."""
         chunks = []
         filename = os.path.basename(file_path)
+        failures = []
         
         try:
             # First try PyMuPDF for quick text extraction
-            doc = fitz.open(file_path)
-            for page_idx, page in enumerate(doc):
-                page_num = page_idx + 1
-                text = page.get_text()
-                if text.strip():
-                    chunks.append({
-                        "text": text,
-                        "page_num": page_num,
-                        "source_doc": filename,
-                        "type": "text"
-                    })
-            doc.close()
+            with fitz.open(file_path) as doc:
+                for page_idx, page in enumerate(doc):
+                    page_num = page_idx + 1
+                    text = page.get_text()
+                    if text.strip():
+                        chunks.append({
+                            "text": text,
+                            "page_num": page_num,
+                            "source_doc": filename,
+                            "type": "text"
+                        })
         except Exception as e:
-            print(f"PyMuPDF error: {e}")
+            failures.append(("PyMuPDF", e))
+            logger.warning("PyMuPDF extraction failed for %s; trying fallback.", file_path, exc_info=True)
 
         # If no text extracted, or to capture structured tables, use pdfplumber
         if not chunks:
@@ -57,11 +63,26 @@ class DocumentParser:
                                     "type": "table"
                                 })
             except Exception as e:
-                print(f"pdfplumber error: {e}")
+                failures.append(("pdfplumber", e))
+                logger.warning("pdfplumber extraction failed for %s; trying OCR.", file_path, exc_info=True)
                 
         # If still empty, it might be a scanned PDF. Let's try OCR.
         if not chunks:
-            chunks = DocumentParser.ocr_pdf(file_path)
+            try:
+                chunks = DocumentParser.ocr_pdf(file_path)
+            except DocumentParseError as e:
+                failures.append(("OCR", e))
+                if failures:
+                    strategy, cause = failures[-1]
+                    raise DocumentParseError(
+                        f"Unable to extract content from PDF using PyMuPDF, pdfplumber, or OCR: {e}"
+                    ) from cause
+                raise
+            if not chunks and failures:
+                strategy, cause = failures[-1]
+                raise DocumentParseError(
+                    f"Unable to extract content from PDF; {strategy} and fallback strategies failed."
+                ) from cause
 
         return chunks
 
@@ -71,28 +92,29 @@ class DocumentParser:
         chunks = []
         filename = os.path.basename(file_path)
         try:
-            doc = fitz.open(file_path)
-            for page_idx, page in enumerate(doc):
-                page_num = page_idx + 1
-                pix = page.get_pixmap()
-                img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                
-                try:
-                    text = pytesseract.image_to_string(img_data)
-                except Exception as t_err:
-                    print(f"Tesseract not configured or missing: {t_err}. Mocking text from scan.")
-                    text = f"[Scanned Page {page_num}] Unable to run full OCR because Tesseract binary is not installed on system."
-                
-                if text.strip():
-                    chunks.append({
-                        "text": text,
-                        "page_num": page_num,
-                        "source_doc": filename,
-                        "type": "ocr_text"
-                    })
-            doc.close()
+            with fitz.open(file_path) as doc:
+                for page_idx, page in enumerate(doc):
+                    page_num = page_idx + 1
+                    pix = page.get_pixmap()
+                    img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    try:
+                        text = pytesseract.image_to_string(img_data)
+                    except Exception as t_err:
+                        raise DocumentParseError(
+                            f"OCR is unavailable or failed for scanned PDF page {page_num}: {t_err}"
+                        ) from t_err
+
+                    if text.strip():
+                        chunks.append({
+                            "text": text,
+                            "page_num": page_num,
+                            "source_doc": filename,
+                            "type": "ocr_text"
+                        })
         except Exception as e:
-            print(f"OCR PDF error: {e}")
+            if isinstance(e, DocumentParseError):
+                raise
+            raise DocumentParseError(f"OCR failed for scanned PDF: {e}") from e
         return chunks
 
     @staticmethod
@@ -104,8 +126,9 @@ class DocumentParser:
             try:
                 text = pytesseract.image_to_string(img)
             except Exception as t_err:
-                print(f"Tesseract missing: {t_err}")
-                text = f"[Scanned Image] Tesseract OCR not available to parse {filename}."
+                raise DocumentParseError(
+                    f"OCR is unavailable or failed for image {filename}: {t_err}"
+                ) from t_err
                 
             return [{
                 "text": text,
@@ -113,9 +136,10 @@ class DocumentParser:
                 "source_doc": filename,
                 "type": "ocr_text"
             }]
+        except DocumentParseError:
+            raise
         except Exception as e:
-            print(f"Parse Image error: {e}")
-            return []
+            raise DocumentParseError(f"Unable to parse image {filename}: {e}") from e
 
     @staticmethod
     def parse_csv(file_path):
@@ -144,7 +168,7 @@ class DocumentParser:
                     "type": "csv_data"
                 })
         except Exception as e:
-            print(f"CSV Parse error: {e}")
+            raise DocumentParseError(f"Unable to parse CSV {filename}: {e}") from e
         return chunks
 
     @staticmethod
@@ -170,7 +194,7 @@ class DocumentParser:
                         "type": "excel_data"
                     })
         except Exception as e:
-            print(f"Excel Parse error: {e}")
+            raise DocumentParseError(f"Unable to parse Excel {filename}: {e}") from e
         return chunks
 
     @staticmethod
