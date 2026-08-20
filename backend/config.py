@@ -1,8 +1,10 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 class Config:
     SECRET_KEY = os.getenv("JWT_SECRET_KEY", "sme-fintech-jwt-secret-key-1029384756")
@@ -31,12 +33,12 @@ class Config:
     def validate_oauth_config(cls):
         """Validates Google OAuth configuration at startup without crashing the application."""
         if not cls.GOOGLE_CLIENT_ID or not cls.GOOGLE_CLIENT_SECRET:
-            print("[WARNING] Google OAuth credentials are missing or incomplete. Google login will be disabled.")
+            logger.warning("Google OAuth credentials are missing or incomplete. Google login will be disabled.")
             return False
         if "apps.googleusercontent.com" not in cls.GOOGLE_CLIENT_ID:
-            print("[WARNING] GOOGLE_CLIENT_ID format appears malformed. Google login might fail.")
+            logger.warning("GOOGLE_CLIENT_ID format appears malformed. Google login might fail.")
             return False
-        print(f"[INFO] Google OAuth configuration validated successfully for Client ID: {cls.GOOGLE_CLIENT_ID[:15]}...")
+        logger.info("Google OAuth configuration validated successfully.")
         return True
 
 # Ensure required directories exist

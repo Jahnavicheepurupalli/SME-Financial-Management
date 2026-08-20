@@ -1,9 +1,11 @@
 import re
+import logging
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, unset_jwt_cookies
 from flask_bcrypt import Bcrypt
 from backend.database.db import SessionLocal
 from backend.models.models import User
+logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint('auth', __name__)
 bcrypt = Bcrypt()
@@ -17,7 +19,6 @@ def validate_password(password):
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json() or {}
-    print(f"[DEBUG] Incoming signup request: {data}")
     
     full_name = data.get('name') or data.get('full_name')
     email = data.get('email')
@@ -25,15 +26,12 @@ def signup():
     confirm_password = data.get('confirm_password')
 
     if not all([full_name, email, password]):
-        print("[DEBUG] Signup validation failed: missing name, email, or password.")
         return jsonify({"message": "Name, email, and password are required"}), 400
 
     if confirm_password and password != confirm_password:
-        print("[DEBUG] Signup validation failed: password mismatch.")
         return jsonify({"message": "Passwords do not match"}), 400
 
     if not validate_password(password):
-        print("[DEBUG] Signup validation failed: password does not meet complexity rules.")
         return jsonify({
             "message": "Password must be at least 8 characters long, contain an uppercase letter, a lowercase letter, a number, and a special character."
         }), 400
@@ -42,7 +40,6 @@ def signup():
     try:
         existing_user = db.query(User).filter(User.email == email).first()
         if existing_user:
-            print(f"[DEBUG] Signup failed: email {email} already registered.")
             return jsonify({"message": "Email already registered"}), 400
 
         pw_hash = bcrypt.generate_password_hash(password).decode('utf-8')
@@ -50,7 +47,6 @@ def signup():
         
         db.add(new_user)
         db.commit()
-        print(f"[DEBUG] Signup success: user {email} created.")
         return jsonify({
             "success": True,
             "message": "Registration successful",
@@ -60,10 +56,10 @@ def signup():
                 "full_name": new_user.full_name
             }
         }), 201
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"[DEBUG] Signup Exception: {str(e)}")
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Unexpected error during signup.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -96,8 +92,9 @@ def login():
                 "full_name": user.full_name
             }
         }), 200
-    except Exception as e:
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+    except Exception:
+        logger.exception("Unexpected error during login.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -131,7 +128,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except ValueError as ve:
         err_str = str(ve).lower()
-        print(f"[DEBUG OAUTH] Token verification ValueError: {ve}")
+        logger.warning("Google token verification rejected.", exc_info=True)
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -140,7 +137,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except Exception as e:
         err_str = str(e).lower()
-        print(f"[DEBUG OAUTH] Token verification exception: {e}")
+        logger.exception("Unexpected Google token verification error.")
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -167,9 +164,10 @@ def google_login():
                 "full_name": user.full_name
             }
         }), 200
-    except Exception as e:
+    except Exception:
         db.rollback()
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Unexpected error during Google login.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -203,9 +201,10 @@ def forgot_password():
         user.password_hash = pw_hash
         db.commit()
         return jsonify({"message": "Password has been reset successfully"}), 200
-    except Exception as e:
+    except Exception:
         db.rollback()
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Unexpected error while resetting password.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -225,6 +224,9 @@ def profile():
                 "full_name": user.full_name
             }
         }), 200
+    except Exception:
+        logger.exception("Unexpected error while loading the user profile.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 

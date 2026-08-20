@@ -1,4 +1,5 @@
 import os
+import logging
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
@@ -8,10 +9,35 @@ from backend.models.models import Document, AnalysisHistory
 from backend.services.parser import DocumentParser
 from backend.services.vector_store import VectorStoreManager
 from backend.agents.agent import FinancialIntelligenceAgent
+from backend.exceptions import AnalysisStorageError, DocumentParseError
+logger = logging.getLogger(__name__)
 
 doc_bp = Blueprint('document', __name__)
 
 ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls'}
+
+
+def _remove_file(file_path):
+    if not os.path.exists(file_path):
+        return
+    try:
+        os.remove(file_path)
+    except OSError:
+        logger.warning("Unable to remove file %s.", file_path, exc_info=True)
+
+
+def _mark_document_failed(document_id):
+    failed_db = SessionLocal()
+    try:
+        failed_doc = failed_db.query(Document).filter(Document.id == document_id).first()
+        if failed_doc:
+            failed_doc.status = "failed"
+            failed_db.commit()
+    except Exception:
+        failed_db.rollback()
+        logger.exception("Unable to mark document %s as failed.", document_id)
+    finally:
+        failed_db.close()
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -49,8 +75,13 @@ def check_is_financial_file(file_path, file_type):
                 text = "\n".join(rows)
             wb.close()
     except Exception as e:
-        print(f"[DEBUG VALIDATION] Fast validation extraction error: {e}")
-        return False
+        logger.exception("Unable to inspect uploaded file %s during validation.", file_path)
+        raise DocumentParseError(
+            f"Unable to read uploaded {file_type.lower()} file: {e}",
+            user_message=(
+                f"The uploaded {file_type.lower()} file could not be read; it may be corrupt or unreadable."
+            )
+        ) from e
 
     if not text or not text.strip():
         return False
@@ -84,12 +115,12 @@ def check_is_financial_file(file_path, file_type):
 
     # If document has resume/academic/certificate indicators and weak financial context, reject
     if len(non_fin_matches) >= 2 or (len(non_fin_matches) >= 1 and len(fin_matches) < 3):
-        print(f"[VALIDATION] Rejected non-financial document. Non-financial keywords found: {non_fin_matches}")
+        logger.info("Rejected non-financial document with validation indicators: %s", non_fin_matches)
         return False
 
     # Require at least 2 distinct financial keywords
     if len(fin_matches) < 2:
-        print(f"[VALIDATION] Rejected document. Insufficient financial keywords found: {fin_matches}")
+        logger.info("Rejected document with insufficient financial keywords: %s", fin_matches)
         return False
 
     return True
@@ -113,16 +144,32 @@ def upload_file():
         }), 400
 
     # Ensure upload folder exists
-    os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+    try:
+        os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+    except OSError:
+        logger.exception("Unable to prepare upload folder %s.", Config.UPLOAD_FOLDER)
+        return jsonify({"message": "Unable to prepare storage for the uploaded file. Please try again."}), 500
     
     filename = secure_filename(file.filename)
     file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
-    file.save(file_path)
-    file_size = os.path.getsize(file_path)
+    try:
+        file.save(file_path)
+        file_size = os.path.getsize(file_path)
+    except Exception:
+        logger.exception("Unable to save or inspect uploaded file %s.", filename)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                logger.warning("Unable to remove incomplete upload %s.", file_path, exc_info=True)
+        return jsonify({"message": "Unable to save the uploaded file. Please try again."}), 500
 
     # Validate file size
     if file_size > 10 * 1024 * 1024:  # 10 MB limit
-        os.remove(file_path)
+        try:
+            os.remove(file_path)
+        except OSError:
+            logger.warning("Unable to remove oversized upload %s.", file_path, exc_info=True)
         return jsonify({"message": "File exceeds the 10MB size limit."}), 400
 
     # Determine file type category
@@ -134,15 +181,29 @@ def upload_file():
         file_type = "Excel"
 
     # content-based validation check before parser/db record/embeddings/analysis
-    if not check_is_financial_file(file_path, file_type):
-        if os.path.exists(file_path):
+    try:
+        is_financial_file = check_is_financial_file(file_path, file_type)
+    except DocumentParseError as e:
+        logger.warning("Uploaded file failed content validation: %s", e, exc_info=True)
+        try:
             os.remove(file_path)
+        except OSError:
+            logger.warning("Unable to remove unreadable upload %s.", file_path, exc_info=True)
+        return jsonify({"message": e.user_message}), 422
+
+    if not is_financial_file:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                logger.warning("Unable to remove rejected upload %s.", file_path, exc_info=True)
         return jsonify({
             "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
         }), 400
 
     # Initialize MySQL DB session and create record since file is validated
     db = SessionLocal()
+    doc_record = None
     try:
         doc_record = Document(
             user_id=int(user_id),
@@ -167,6 +228,7 @@ def upload_file():
         if not chunks:
             doc_record.status = "failed"
             db.commit()
+            _remove_file(file_path)
             return jsonify({"message": "Document contains no extractable data or is corrupted."}), 400
 
         # 2. Chunking & Embeddings
@@ -185,6 +247,10 @@ def upload_file():
             "forward_looking_flags": analysis_result.get("forward_looking_flags", []),
             "metrics": analysis_result.get("metrics", {}),
             "charts": analysis_result.get("charts", {}),
+            "analysis_mode": analysis_result.get("analysis_mode", "llm"),
+            "degraded_reason": analysis_result.get("degraded_reason"),
+            "metrics_source": analysis_result.get("metrics_source"),
+            "data_quality": analysis_result.get("data_quality"),
             "pdf_url": f"/api/report/{doc_record.id}",
             "document": {
                 "id": doc_record.id,
@@ -194,11 +260,26 @@ def upload_file():
             }
         }), 200
 
-    except Exception as e:
+    except DocumentParseError as e:
         db.rollback()
-        import traceback
-        traceback.print_exc()
-        return jsonify({"message": f"An error occurred during upload/analysis processing: {str(e)}"}), 500
+        logger.warning("Document %s could not be parsed: %s", filename, e, exc_info=True)
+        if doc_record:
+            _mark_document_failed(doc_record.id)
+        _remove_file(file_path)
+        return jsonify({"message": e.user_message}), 422
+    except AnalysisStorageError:
+        db.rollback()
+        logger.exception("Analysis for document %s could not be saved.", filename)
+        if doc_record:
+            _mark_document_failed(doc_record.id)
+        return jsonify({"message": "Analysis could not be saved. Please try again."}), 500
+    except Exception:
+        db.rollback()
+        logger.exception("Unexpected error during upload/analysis processing for %s.", filename)
+        if doc_record:
+            _mark_document_failed(doc_record.id)
+        _remove_file(file_path)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -219,6 +300,9 @@ def get_history():
                 "created_at": doc.created_at.isoformat()
             })
         return jsonify({"history": history_list}), 200
+    except Exception:
+        logger.exception("Unexpected error while loading document history.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -240,6 +324,9 @@ def get_history_detail(doc_id):
             result['_id'] = str(result['_id'])
             
         return jsonify({"analysis": result, "filename": doc.filename}), 200
+    except Exception:
+        logger.exception("Unexpected error while loading analysis details for document %s.", doc_id)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -265,6 +352,9 @@ def download_report(doc_id):
             as_attachment=True,
             download_name=f"Financial_Analysis_{doc.filename}.pdf"
         )
+    except Exception:
+        logger.exception("Unexpected error while downloading report for document %s.", doc_id)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -294,10 +384,9 @@ def chat_with_document():
             "success": True,
             "response": response_text
         }), 200
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"message": f"Chatbot error: {str(e)}"}), 500
+    except Exception:
+        logger.exception("Unexpected error while answering document chat request.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -321,33 +410,50 @@ def delete_document(doc_id):
         db.delete(doc)
         db.commit()
         
+        cleanup_failures = []
+
         # 2. Delete analysis from MongoDB
-        mongo_db["analysis_results"].delete_one({"document_id": doc_id})
-        
+        try:
+            mongo_db["analysis_results"].delete_one({"document_id": doc_id})
+        except Exception:
+            cleanup_failures.append("analysis record")
+            logger.exception("Failed to delete MongoDB analysis for document %s.", doc_id)
+
         # 3. Delete physical files if they exist
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-            except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete uploaded file: {e}")
+            except OSError:
+                cleanup_failures.append("uploaded file")
+                logger.warning("Failed to delete uploaded file %s.", file_path, exc_info=True)
                 
         if os.path.exists(pdf_path):
             try:
                 os.remove(pdf_path)
-            except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete PDF report: {e}")
+            except OSError:
+                cleanup_failures.append("PDF report")
+                logger.warning("Failed to delete PDF report %s.", pdf_path, exc_info=True)
                 
         # 4. Remove document chunks from vector store
-        vstore = VectorStoreManager.get_instance()
-        vstore.remove_document_chunks(filename)
+        try:
+            vstore = VectorStoreManager.get_instance()
+            vstore.remove_document_chunks(filename)
+        except Exception:
+            cleanup_failures.append("vector store chunks")
+            logger.exception("Failed to remove vector-store chunks for document %s.", doc_id)
         
         return jsonify({
             "success": True,
-            "message": "Document deleted successfully"
+            "message": (
+                "Document deleted successfully"
+                if not cleanup_failures
+                else f"Document deleted from the database, but cleanup failed for: {', '.join(cleanup_failures)}."
+            )
         }), 200
         
-    except Exception as e:
+    except Exception:
         db.rollback()
-        return jsonify({"message": f"Error deleting document: {str(e)}"}), 500
+        logger.exception("Unexpected error deleting document %s.", doc_id)
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()

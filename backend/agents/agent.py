@@ -2,15 +2,17 @@ import os
 import json
 import datetime
 import re
+import logging
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from backend.config import Config
 from backend.services.vector_store import VectorStoreManager
-from backend.services.parser import DocumentParser
 from backend.database.db import mongo_db, SessionLocal
 from backend.models.models import Document, AnalysisHistory
 from backend.services.pdf_generator import PDFReportGenerator
+from backend.exceptions import AnalysisStorageError
+logger = logging.getLogger(__name__)
 
 # List of allowed topics for chatbot
 ALLOWED_TOPICS = [
@@ -78,36 +80,32 @@ def document_reader_tool(query: str) -> str:
         page_num = chunk.get("page_num", "Unknown")
         text = chunk.get("text", "")
         formatted_chunks.append(f"--- SOURCE: {source_doc}, Page: {page_num} ---\n{text}\n")
-        
+
     return "\n".join(formatted_chunks)
 
-# 2. PDF Generator Tool
-@tool
-def pdf_generator_tool(document_id: int, analysis_results_json: str) -> str:
-    """Generates the professional ReportLab PDF and returns the path to the PDF file."""
+def _generate_pdf(document_id: int, analysis_data: dict) -> str:
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         doc_record = db.query(Document).filter(Document.id == document_id).first()
         if not doc_record:
-            return f"Error: Document with ID {document_id} not found."
+            raise AnalysisStorageError(f"Document with ID {document_id} not found.")
             
         filename = f"report_{document_id}.pdf"
         pdf_path = os.path.join(Config.REPORTS_FOLDER, filename)
-        
-        analysis_data = json.loads(analysis_results_json)
-        PDFReportGenerator.generate(pdf_path, doc_record.filename, analysis_data)
-        db.close()
+        try:
+            PDFReportGenerator.generate(pdf_path, doc_record.filename, analysis_data)
+        except Exception as e:
+            raise AnalysisStorageError(f"Unable to generate PDF report for document {document_id}.") from e
         return pdf_path
+    except AnalysisStorageError:
+        raise
     except Exception as e:
-        return f"Error generating PDF: {str(e)}"
+        raise AnalysisStorageError(f"Unable to generate PDF report for document {document_id}.") from e
+    finally:
+        db.close()
 
-# 3. Mongo Storage Tool
-@tool
-def mongo_storage_tool(document_id: int, analysis_results_json: str, reasoning_log: str) -> str:
-    """Stores final output, reasoning logs, and parsed metadata in MongoDB."""
+def _store_analysis_in_mongo(document_id: int, analysis_data: dict, reasoning_log: str):
     try:
-        analysis_data = json.loads(analysis_results_json)
-        # Update or insert
         mongo_db["analysis_results"].replace_one(
             {"document_id": document_id},
             {
@@ -118,36 +116,81 @@ def mongo_storage_tool(document_id: int, analysis_results_json: str, reasoning_l
                 "missing_data_detection": analysis_data.get("missing_data_detection", []),
                 "metrics": analysis_data.get("metrics", {}),
                 "charts": analysis_data.get("charts", {}),
+                "analysis_mode": analysis_data.get("analysis_mode", "llm"),
+                "degraded_reason": analysis_data.get("degraded_reason"),
+                "metrics_source": analysis_data.get("metrics_source"),
+                "data_quality": analysis_data.get("data_quality"),
                 "reasoning_log": reasoning_log,
                 "created_at": datetime.datetime.utcnow().isoformat()
             },
             upsert=True
         )
-        return "Successfully saved to MongoDB."
     except Exception as e:
-        return f"Error saving to MongoDB: {e}"
+        raise AnalysisStorageError(f"Unable to save analysis for document {document_id}.") from e
+
+def _update_mysql_storage(document_id: int, status: str):
+    db = SessionLocal()
+    try:
+        doc = db.query(Document).filter(Document.id == document_id).first()
+        if not doc:
+            raise AnalysisStorageError(f"Document with ID {document_id} not found.")
+        doc.status = status
+        db.commit()
+
+        history = AnalysisHistory(user_id=doc.user_id, document_id=document_id, status=status)
+        db.add(history)
+        db.commit()
+    except AnalysisStorageError:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise AnalysisStorageError(f"Unable to update status for document {document_id}.") from e
+    finally:
+        db.close()
+
+
+def _mark_analysis_failed(document_id):
+    try:
+        _update_mysql_storage(document_id, "failed")
+    except AnalysisStorageError:
+        logger.exception("Unable to mark document %s as failed after analysis failure.", document_id)
+
+
+# 2. PDF Generator Tool
+@tool
+def pdf_generator_tool(document_id: int, analysis_results_json: str) -> str:
+    """Generates the professional ReportLab PDF and returns the path to the PDF file."""
+    try:
+        return _generate_pdf(document_id, json.loads(analysis_results_json))
+    except Exception:
+        logger.exception("PDF generation tool failed for document %s.", document_id)
+        return f"Error generating PDF for document {document_id}."
+
+
+# 3. Mongo Storage Tool
+@tool
+def mongo_storage_tool(document_id: int, analysis_results_json: str, reasoning_log: str) -> str:
+    """Stores final output, reasoning logs, and parsed metadata in MongoDB."""
+    try:
+        _store_analysis_in_mongo(document_id, json.loads(analysis_results_json), reasoning_log)
+        return "Successfully saved to MongoDB."
+    except Exception:
+        logger.exception("MongoDB storage tool failed for document %s.", document_id)
+        return f"Error saving analysis for document {document_id}."
+
 
 # 4. MySQL Storage Tool
 @tool
 def mysql_storage_tool(document_id: int, status: str) -> str:
     """Updates document analysis status and details in MySQL."""
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if doc:
-            doc.status = status
-            db.commit()
-            
-            history = AnalysisHistory(user_id=doc.user_id, document_id=document_id, status=status)
-            db.add(history)
-            db.commit()
-            return "Successfully updated MySQL database."
-        return "Document not found in MySQL."
-    except Exception as e:
-        db.rollback()
-        return f"Error updating MySQL: {e}"
-    finally:
-        db.close()
+        _update_mysql_storage(document_id, status)
+        return "Successfully updated MySQL database."
+    except Exception:
+        logger.exception("MySQL storage tool failed for document %s.", document_id)
+        return f"Error updating analysis status for document {document_id}."
+
 
 class FinancialIntelligenceAgent:
     def __init__(self):
@@ -160,10 +203,10 @@ class FinancialIntelligenceAgent:
 
     def run_analysis(self, document_id: int):
         """Runs the agent pipeline automatically. Extracts information and returns the structured JSON."""
-        print(f"Starting automatic agent analysis for Document ID: {document_id}")
+        logger.info("Starting automatic agent analysis for document %s.", document_id)
         
         # Mark as processing in MySQL
-        mysql_storage_tool.func(document_id, "processing")
+        _update_mysql_storage(document_id, "processing")
         
         # Get chunks from vector store
         vstore = VectorStoreManager.get_instance()
@@ -298,7 +341,7 @@ Document Context:
 """
 
         try:
-            print("[DEBUG AGENT] Sending request to Groq LLM API...")
+            logger.info("Sending analysis request to Groq for document %s.", document_id)
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -306,7 +349,7 @@ Document Context:
             
             response = self.llm.invoke(messages)
             content = response.content.strip()
-            print("[DEBUG AGENT] Received response from Groq LLM API.")
+            logger.info("Received analysis response from Groq for document %s.", document_id)
             
             if content.startswith("```json"):
                 content = content[7:]
@@ -315,38 +358,48 @@ Document Context:
             content = content.strip()
             
             parsed_json = json.loads(content)
-            
-            # Merge precise pre-calculated metrics/charts to prevent LLM errors or hallucinations
-            parsed_json["metrics"] = calculated_metrics["metrics"]
-            parsed_json["charts"] = calculated_metrics["charts"]
-            
-            # Compile PDF
-            pdf_generator_tool.func(document_id, json.dumps(parsed_json))
-            
-            # Save to MongoDB
-            mongo_storage_tool.func(document_id, json.dumps(parsed_json), "Agent successfully analyzed via LLM.")
-            
-            # Update MySQL status
-            mysql_storage_tool.func(document_id, "analyzed")
-            
-            return parsed_json
-            
-        except Exception as e:
-            print(f"[DEBUG AGENT] Groq Agent run failed: {str(e)}. Triggering local rule-based analysis engine...")
-            
-            # Fallback to local rule-based analysis using the calculated metrics
-            fallback_json = self._assemble_local_fallback(calculated_metrics, filename)
-            
-            # Compile PDF
-            pdf_generator_tool.func(document_id, json.dumps(fallback_json))
-            
-            # Save to MongoDB
-            mongo_storage_tool.func(document_id, json.dumps(fallback_json), f"Local rule-based fallback executed successfully: {str(e)}")
-            
-            # Update MySQL status
-            mysql_storage_tool.func(document_id, "analyzed")
-            
+        except Exception:
+            logger.exception(
+                "Groq analysis invocation or response parsing failed for document %s; "
+                "using local rule-based fallback.",
+                document_id
+            )
+            fallback_reason = "AI analysis was unavailable; local rule-based analysis was used."
+            fallback_json = self._assemble_local_fallback(
+                calculated_metrics, filename, fallback_reason
+            )
+            try:
+                _generate_pdf(document_id, fallback_json)
+                _store_analysis_in_mongo(
+                    document_id,
+                    fallback_json,
+                    "Local rule-based fallback analysis was used because AI analysis was unavailable."
+                )
+                _update_mysql_storage(document_id, "analyzed")
+            except AnalysisStorageError:
+                logger.exception("Unable to persist fallback analysis for document %s.", document_id)
+                _mark_analysis_failed(document_id)
+                raise
             return fallback_json
+
+        # Merge precise pre-calculated metrics/charts to prevent LLM errors or hallucinations
+        parsed_json["metrics"] = calculated_metrics["metrics"]
+        parsed_json["charts"] = calculated_metrics["charts"]
+        parsed_json["analysis_mode"] = "llm"
+        parsed_json["metrics_source"] = calculated_metrics.get("metrics_source")
+        parsed_json["data_quality"] = calculated_metrics.get("data_quality")
+        try:
+            _generate_pdf(document_id, parsed_json)
+            _store_analysis_in_mongo(
+                document_id, parsed_json, "Agent successfully analyzed via LLM."
+            )
+            _update_mysql_storage(document_id, "analyzed")
+        except AnalysisStorageError:
+            logger.exception("Unable to persist LLM analysis for document %s.", document_id)
+            _mark_analysis_failed(document_id)
+            raise
+
+        return parsed_json
 
     def run_chat_query(self, document_id: int, query: str, history: list) -> str:
         """Processes a chat query via RAG on the document's vector chunks."""
@@ -370,8 +423,9 @@ Document Context:
         # Get metrics if available
         metrics_summary = ""
         analysis = mongo_db["analysis_results"].find_one({"document_id": document_id})
-        if analysis and "metrics" in analysis:
-            metrics_summary = f"Pre-calculated Document Metrics:\n{json.dumps(analysis['metrics'], indent=2)}"
+        metrics = (analysis or {}).get("metrics") or {}
+        if metrics:
+            metrics_summary = f"Pre-calculated Document Metrics:\n{json.dumps(metrics, indent=2)}"
             
         # 3. Construct System Prompt
         system_prompt = f"""You are a professional Financial Document Intelligence Chatbot for SMEs.
@@ -396,16 +450,16 @@ Document Context Chunks:
         try:
             response = self.llm.invoke(messages)
             return response.content.strip()
-        except Exception as e:
+        except Exception:
             # Local fallback response
-            print(f"[DEBUG CHAT] LLM chat failed: {e}. Executing local fallback response...")
+            logger.exception("LLM chat failed for document %s; executing local fallback response.", document_id)
             # Keyword match fallback response
-            if "revenue" in query.lower() and analysis:
-                return f"Based on the local analysis, the total revenue is INR {analysis['metrics'].get('total_revenue', 0):,}."
-            elif "profit" in query.lower() and analysis:
-                return f"The net profit calculated for this document is INR {analysis['metrics'].get('net_profit', 0):,} with a margin of {analysis['metrics'].get('profit_margin', 0)}%."
-            elif "expense" in query.lower() and analysis:
-                return f"The total expenses are INR {analysis['metrics'].get('total_expense', 0):,}."
+            if "revenue" in query.lower() and metrics:
+                return f"Based on the local analysis, the total revenue is INR {metrics.get('total_revenue', 0):,}."
+            elif "profit" in query.lower() and metrics:
+                return f"The net profit calculated for this document is INR {metrics.get('net_profit', 0):,} with a margin of {metrics.get('profit_margin', 0)}%."
+            elif "expense" in query.lower() and metrics:
+                return f"The total expenses are INR {metrics.get('total_expense', 0):,}."
             return "The AI agent is currently offline. Based on the document context, please review the calculated metric cards on your dashboard or download the PDF report for complete details."
 
     def _calculate_metrics_directly(self, file_path, chunks, filename):
@@ -441,7 +495,8 @@ Document Context Chunks:
             }
         }
         
-        missing_fields = []
+        metrics_source = "estimated"
+        data_quality = "Metrics are estimated from available document text."
         
         # If it's a CSV or Excel statement file
         if file_path and os.path.exists(file_path):
@@ -463,12 +518,15 @@ Document Context Chunks:
                         revenue = 0.0
                         expense = 0.0
                         monthly_data = {}
+                        unparseable_amounts = 0
+                        unparseable_dates = 0
                         
                         for idx, row in df.iterrows():
                             amt = 0.0
                             try:
                                 amt = float(str(row["amount"]).replace(",", ""))
-                            except:
+                            except (TypeError, ValueError):
+                                unparseable_amounts += 1
                                 continue
                                 
                             t_type = str(row.get("type", "")).lower()
@@ -478,8 +536,8 @@ Document Context Chunks:
                             month = "Jan"
                             try:
                                 month = pd.to_datetime(date_str).strftime("%b")
-                            except:
-                                pass
+                            except (TypeError, ValueError):
+                                unparseable_dates += 1
                                 
                             if month not in monthly_data:
                                 monthly_data[month] = {"revenue": 0.0, "expense": 0.0}
@@ -490,6 +548,20 @@ Document Context Chunks:
                             elif "debit" in t_type or "withdrawal" in t_type or "outward" in t_type or "debit" in df.columns:
                                 expense += amt
                                 monthly_data[month]["expense"] += amt
+
+                        skipped_rows = unparseable_amounts + unparseable_dates
+                        if skipped_rows:
+                            logger.warning(
+                                "Skipped %s unparseable transaction fields while calculating metrics for %s "
+                                "(amounts: %s, dates: %s).",
+                                skipped_rows, filename, unparseable_amounts, unparseable_dates
+                            )
+                        metrics_source = "extracted"
+                        data_quality = (
+                            "Metrics extracted from the uploaded transaction data."
+                            if not skipped_rows
+                            else f"Metrics extracted with {skipped_rows} unparseable transaction fields skipped."
+                        )
                                 
                         metrics["total_revenue"] = round(revenue, 2)
                         metrics["total_expense"] = round(expense, 2)
@@ -538,6 +610,8 @@ Document Context Chunks:
                         metrics["profit_margin"] = round((metrics["net_profit"] / metrics["total_revenue"]) * 100, 2) if metrics["total_revenue"] > 0 else 15.0
                         metrics["operating_margin"] = round(metrics["profit_margin"] * 0.9, 2)
                         metrics["cash_flow"] = float(str(latest_row.get("cash flow from operating", latest_row.get("cash_flow", metrics["net_profit"] * 1.1))).replace(",", ""))
+                        metrics_source = "extracted"
+                        data_quality = "Metrics extracted from the uploaded financial statement."
                         
                         metrics["avg_monthly_revenue"] = round(metrics["total_revenue"] / 12, 2)
                         metrics["avg_monthly_expense"] = round(metrics["total_expense"] / 12, 2)
@@ -566,14 +640,24 @@ Document Context Chunks:
                         charts["profit_trend"] = profs
                         charts["cash_flow"] = cfs
                         
-            except Exception as e:
-                print(f"[DEBUG METRICS] Directly parsed CSV/Excel error: {e}")
+            except Exception:
+                logger.exception(
+                    "Direct CSV/Excel metric extraction failed for %s; using estimated metrics.",
+                    filename
+                )
+                metrics_source = "estimated"
+                data_quality = "Direct metric extraction failed; figures are estimated and should be verified."
                 
         # If no metrics were extracted (e.g. PDF scan or parsing failure)
         if metrics["total_revenue"] == 0.0:
             # Fallback to smart parsing of PDF texts using Regex
             text_context = "\n".join([c.get("text", "") for c in chunks])
             metrics = self._regex_extract_metrics(text_context, filename)
+            metrics_source = "estimated"
+            data_quality = (
+                "Figures are estimated from document text and defaults where values were unavailable; "
+                "verify them against the source document."
+            )
             
             # Generate default trends
             charts["monthly_comparison"]["labels"] = ["Q1", "Q2", "Q3", "Q4"]
@@ -584,7 +668,12 @@ Document Context Chunks:
             charts["profit_trend"] = [r - e for r, e in zip(charts["revenue_trend"], charts["expense_trend"])]
             charts["cash_flow"] = charts["profit_trend"]
             
-        return {"metrics": metrics, "charts": charts}
+        return {
+            "metrics": metrics,
+            "charts": charts,
+            "metrics_source": metrics_source,
+            "data_quality": data_quality
+        }
 
     def _regex_extract_metrics(self, text, filename):
         clean_text = text.replace(",", "")
@@ -618,7 +707,7 @@ Document Context Chunks:
             "avg_monthly_revenue": round(revenue / 12, 2)
         }
 
-    def _assemble_local_fallback(self, calculated, filename):
+    def _assemble_local_fallback(self, calculated, filename, degraded_reason):
         """Assembles a clean fallback JSON when Groq is unavailable."""
         metrics = calculated["metrics"]
         charts = calculated["charts"]
@@ -693,5 +782,9 @@ Document Context Chunks:
                 }
             ],
             "metrics": metrics,
-            "charts": charts
+            "charts": charts,
+            "analysis_mode": "local_fallback",
+            "degraded_reason": degraded_reason,
+            "metrics_source": calculated.get("metrics_source"),
+            "data_quality": calculated.get("data_quality")
         }
