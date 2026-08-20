@@ -5,10 +5,10 @@ from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identi
 from flask_bcrypt import Bcrypt
 from backend.database.db import SessionLocal
 from backend.models.models import User
+logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint('auth', __name__)
 bcrypt = Bcrypt()
-logger = logging.getLogger(__name__)
 
 # Password validation regex
 PASSWORD_REGEX = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
@@ -72,10 +72,10 @@ def signup():
                 "full_name": new_user.full_name
             }
         }), 201
-    except Exception as e:
+    except Exception:
         db.rollback()
-        logger.exception("Signup failed")
-        return jsonify({"message": "Unable to complete registration"}), 500
+        logger.exception("Unexpected error during signup.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -108,9 +108,9 @@ def login():
                 "full_name": user.full_name
             }
         }), 200
-    except Exception as e:
-        logger.exception("Login failed")
-        return jsonify({"message": "Unable to complete login"}), 500
+    except Exception:
+        logger.exception("Unexpected error during login.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -144,7 +144,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except ValueError as ve:
         err_str = str(ve).lower()
-        logger.exception("Google token verification failed")
+        logger.warning("Google token verification rejected.", exc_info=True)
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -153,7 +153,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except Exception as e:
         err_str = str(e).lower()
-        logger.exception("Google token verification failed")
+        logger.exception("Unexpected Google token verification error.")
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -180,10 +180,10 @@ def google_login():
                 "full_name": user.full_name
             }
         }), 200
-    except Exception as e:
+    except Exception:
         db.rollback()
-        logger.exception("Google login failed")
-        return jsonify({"message": "Unable to complete Google authentication"}), 500
+        logger.exception("Unexpected error during Google login.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -213,9 +213,7 @@ def change_password():
         return jsonify({"message": "Passwords do not match"}), 400
 
     if not validate_password(new_password):
-        return jsonify({
-            "message": "Password must meet complexity rules."
-        }), 400
+        return jsonify({"message": "Password must meet complexity rules."}), 400
 
     db = SessionLocal()
     try:
@@ -232,10 +230,10 @@ def change_password():
         user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
         db.commit()
         return jsonify({"message": "Password changed successfully"}), 200
-    except Exception as e:
+    except Exception:
         db.rollback()
-        logger.exception("Password change failed")
-        return jsonify({"message": "Unable to change password"}), 500
+        logger.exception("Unexpected error while changing password.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 
@@ -255,6 +253,9 @@ def profile():
                 "full_name": user.full_name
             }
         }), 200
+    except Exception:
+        logger.exception("Unexpected error while loading the user profile.")
+        return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()
 

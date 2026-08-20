@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 
 # Ensure the project root is on sys.path so that `from backend.xxx import ...`
 # works whether this file is run directly (python backend/app.py) or as a module
@@ -17,18 +18,23 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 from werkzeug.exceptions import RequestEntityTooLarge
+from backend.logging_config import configure_logging
 from backend.config import Config
 from backend.database.db import engine, Base
 from backend.routes.auth import auth_bp
 from backend.routes.document import doc_bp
 
+configure_logging()
+logger = logging.getLogger(__name__)
+
 # Initialize database schemas
 try:
-    print("Creating MySQL tables...")
+    logger.info("Creating database tables...")
     Base.metadata.create_all(bind=engine)
-    print("MySQL tables created/verified.")
-except Exception as e:
-    print(f"Warning: Could not create tables automatically: {e}")
+    logger.info("Database tables created/verified.")
+except Exception:
+    logger.exception("Could not create database tables during startup; aborting.")
+    raise
 
 # Validate Google OAuth credentials on startup
 Config.validate_oauth_config()
@@ -76,4 +82,4 @@ def health():
 if __name__ == '__main__':
     # Start flask application
     print("Starting Flask server on port 5000...")
-    app.run(host='0.0.0.0', port=5000, debug=Config.DEBUG)
+    app.run(host='0.0.0.0', port=5000, debug=True)
