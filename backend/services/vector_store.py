@@ -91,7 +91,12 @@ class VectorStoreManager:
             return []
             
         embeddings_aligned = len(self.embeddings) == len(self.chunks)
-        if self.model is not None and len(self.embeddings) > 0 and embeddings_aligned and not self.keyword_only:
+        if (
+            self.model is not None
+            and len(self.embeddings) > 0
+            and embeddings_aligned
+            and not self.keyword_only
+        ):
             try:
                 query_emb = self.model.encode([query], show_progress_bar=False)[0]
                 

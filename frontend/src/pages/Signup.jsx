@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import * as Lucide from 'lucide-react';
 import { GoogleLogin } from '@react-oauth/google';
 
-export default function Signup({ darkMode, toggleDarkMode }) {
+export default function Signup({ darkMode, toggleDarkMode, googleAuthEnabled }) {
   const { register, handleSubmit, watch, formState: { errors } } = useForm();
   const [serverError, setServerError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -195,16 +195,16 @@ export default function Signup({ darkMode, toggleDarkMode }) {
           </button>
         </form>
 
-        <div className="relative my-4">
+        {googleAuthEnabled && <div className="relative my-4">
           <div className="absolute inset-0 flex items-center">
             <div className="w-full border-t border-slate-200 dark:border-slate-800" />
           </div>
           <div className="relative flex justify-center text-xs uppercase">
             <span className="bg-slate-50 dark:bg-slate-900 px-2 text-slate-500">Or continue with</span>
           </div>
-        </div>
+        </div>}
 
-        <div className="flex justify-center w-full">
+        {googleAuthEnabled && <div className="flex justify-center w-full">
           <GoogleLogin
             onSuccess={async (credentialResponse) => {
               setIsLoading(true);
@@ -227,7 +227,7 @@ export default function Signup({ darkMode, toggleDarkMode }) {
             }}
             useOneTap
           />
-        </div>
+        </div>}
 
         <p className="text-center text-xs text-slate-500 mt-4">
           Already have an account?{' '}

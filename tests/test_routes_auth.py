@@ -58,7 +58,7 @@ def test_signup_duplicate_email(client):
 
 def test_login_success_failures_and_google_user(client, session_factory):
     assert client.post("/api/auth/login", json={}).status_code == 400
-    assert client.post("/api/auth/login", json={"email": "none", "password": "Valid@123"}).status_code == 401
+    assert client.post("/api/auth/login", json={"email": "none@example.com", "password": "Valid@123"}).status_code == 401
     client.post("/api/auth/signup", json={"name": "A", "email": "a@example.com", "password": "Valid@123"})
     response = client.post("/api/auth/login", json={"email": "a@example.com", "password": "wrong"})
     assert response.status_code == 401
@@ -72,26 +72,95 @@ def test_login_success_failures_and_google_user(client, session_factory):
     assert client.post("/api/auth/login", json={"email": "g@example.com", "password": "x"}).status_code == 401
 
 
-def test_forgot_password_reset_and_validation(client):
+def test_forgot_password_and_reset_are_unavailable(client, session_factory):
     client.post("/api/auth/signup", json={"name": "A", "email": "a@example.com", "password": "Valid@123"})
-    assert client.post("/api/auth/forgot-password", json={}).status_code == 400
+    db = session_factory()
+    original_hash = db.query(User).filter(User.email == "a@example.com").first().password_hash
+    db.close()
+
+    for path in ("/api/auth/forgot-password", "/api/auth/reset-password"):
+        response = client.post(
+            path,
+            json={"email": "a@example.com", "new_password": "Changed@123", "confirm_password": "Changed@123"},
+        )
+        assert response.status_code == 503
+        assert "Self-service password reset is unavailable" in response.get_json()["message"]
+
+    db = session_factory()
+    assert db.query(User).filter(User.email == "a@example.com").first().password_hash == original_hash
+    db.close()
+
+
+def test_change_password_success_and_validation(client, auth_token, session_factory):
+    response = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={
+            "current_password": "Valid@123",
+            "new_password": "Changed@123",
+            "confirm_password": "Changed@123",
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_json()["message"] == "Password changed successfully"
     assert client.post(
-        "/api/auth/reset-password",
-        json={"email": "a@example.com", "new_password": "Valid@123", "confirm_password": "Other@123"},
-    ).status_code == 400
-    assert client.post(
-        "/api/auth/reset-password",
-        json={"email": "a@example.com", "new_password": "weak", "confirm_password": "weak"},
-    ).status_code == 400
-    assert client.post(
-        "/api/auth/forgot-password",
-        json={"email": "missing@example.com", "new_password": "Valid@123", "confirm_password": "Valid@123"},
-    ).status_code == 404
-    assert client.post(
-        "/api/auth/reset-password",
-        json={"email": "a@example.com", "new_password": "New@4567", "confirm_password": "New@4567"},
+        "/api/auth/login",
+        json={"email": "test@example.com", "password": "Changed@123"},
     ).status_code == 200
-    assert client.post("/api/auth/login", json={"email": "a@example.com", "password": "New@4567"}).status_code == 200
+
+    wrong_current = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={
+            "current_password": "Wrong@123",
+            "new_password": "Changed2@123",
+            "confirm_password": "Changed2@123",
+        },
+    )
+    assert wrong_current.status_code == 401
+
+    mismatch = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={
+            "current_password": "Changed@123",
+            "new_password": "Changed2@123",
+            "confirm_password": "Different@123",
+        },
+    )
+    assert mismatch.status_code == 400
+
+    weak = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={
+            "current_password": "Changed@123",
+            "new_password": "weak",
+            "confirm_password": "weak",
+        },
+    )
+    assert weak.status_code == 400
+
+    db = session_factory()
+    google_user = User(full_name="Google", email="google-only@example.com", password_hash=None)
+    db.add(google_user)
+    db.commit()
+    google_user_id = google_user.id
+    db.close()
+    from flask_jwt_extended import create_access_token
+    with client.application.app_context():
+        google_token = create_access_token(identity=str(google_user_id))
+    google_only = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {google_token}"},
+        json={
+            "current_password": "Current@123",
+            "new_password": "Changed@123",
+            "confirm_password": "Changed@123",
+        },
+    )
+    assert google_only.status_code == 400
+    assert "Google-only accounts" in google_only.get_json()["message"]
 
 
 def test_profile_and_logout(client, auth_token, session_factory):
@@ -211,10 +280,6 @@ class _BrokenSession:
             {"name": "A", "email": "a@example.com", "password": "Valid@123"},
         ),
         ("/api/auth/login", {"email": "a@example.com", "password": "Valid@123"}),
-        (
-            "/api/auth/reset-password",
-            {"email": "a@example.com", "new_password": "Valid@123", "confirm_password": "Valid@123"},
-        ),
     ],
 )
 def test_auth_database_errors_return_500(client, monkeypatch, path, payload):
@@ -222,6 +287,6 @@ def test_auth_database_errors_return_500(client, monkeypatch, path, payload):
     monkeypatch.setattr(auth_module, "SessionLocal", lambda: broken)
     response = client.post(path, json=payload)
     assert response.status_code == 500
-    assert "database unavailable" in response.get_json()["message"]
-    if path in {"/api/auth/signup", "/api/auth/reset-password"}:
+    assert response.get_json()["message"] == "An unexpected server error occurred. Please try again."
+    if path == "/api/auth/signup":
         assert broken.rolled_back is True

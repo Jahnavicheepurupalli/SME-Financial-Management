@@ -12,20 +12,36 @@ bcrypt = Bcrypt()
 
 # Password validation regex
 PASSWORD_REGEX = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
+EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 def validate_password(password):
-    return re.match(PASSWORD_REGEX, password) is not None
+    return isinstance(password, str) and re.match(PASSWORD_REGEX, password) is not None
+
+
+def normalize_email(email):
+    return email.strip().lower() if isinstance(email, str) else ""
+
+
+def valid_email(email):
+    return len(email) <= 255 and re.fullmatch(EMAIL_REGEX, email) is not None
 
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json() or {}
     
     full_name = data.get('name') or data.get('full_name')
-    email = data.get('email')
+    email = normalize_email(data.get('email'))
     password = data.get('password')
     confirm_password = data.get('confirm_password')
 
-    if not all([full_name, email, password]):
+    if not isinstance(full_name, str) or not full_name.strip() or len(full_name.strip()) > 255:
+        return jsonify({"message": "Name is required and must be 255 characters or fewer"}), 400
+
+    full_name = full_name.strip()
+    if not email or not valid_email(email):
+        return jsonify({"message": "A valid email address is required"}), 400
+
+    if not isinstance(password, str) or not password:
         return jsonify({"message": "Name, email, and password are required"}), 400
 
     if confirm_password and password != confirm_password:
@@ -66,10 +82,10 @@ def signup():
 @auth_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json() or {}
-    email = data.get('email')
+    email = normalize_email(data.get('email'))
     password = data.get('password')
 
-    if not email or not password:
+    if not email or not valid_email(email) or not isinstance(password, str) or not password:
         return jsonify({"message": "Email and password are required"}), 400
 
     db = SessionLocal()
@@ -174,36 +190,49 @@ def google_login():
 @auth_bp.route('/forgot-password', methods=['POST'])
 @auth_bp.route('/reset-password', methods=['POST'])
 def forgot_password():
-    """No OTP/verification flow. Verifies email, then updates password directly."""
+    """Self-service password reset is unavailable without email verification."""
+    return jsonify({
+        "message": "Self-service password reset is unavailable. Please contact the administrator."
+    }), 503
+
+
+@auth_bp.route('/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
     data = request.get_json() or {}
-    email = data.get('email')
+    current_password = data.get('current_password')
     new_password = data.get('new_password')
     confirm_password = data.get('confirm_password')
 
-    if not all([email, new_password, confirm_password]):
-        return jsonify({"message": "Email and new passwords are required"}), 400
+    if not all(isinstance(value, str) and value for value in (
+        current_password, new_password, confirm_password
+    )):
+        return jsonify({"message": "Current and new passwords are required"}), 400
 
     if new_password != confirm_password:
         return jsonify({"message": "Passwords do not match"}), 400
 
     if not validate_password(new_password):
-        return jsonify({
-            "message": "Password must meet complexity rules."
-        }), 400
+        return jsonify({"message": "Password must meet complexity rules."}), 400
 
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == email).first()
+        user = db.query(User).filter(User.id == int(get_jwt_identity())).first()
         if not user:
-            return jsonify({"message": "User not found with this email"}), 404
+            return jsonify({"message": "Account not found"}), 404
+        if not user.password_hash:
+            return jsonify({
+                "message": "Password changes are unavailable for Google-only accounts."
+            }), 400
+        if not bcrypt.check_password_hash(user.password_hash, current_password):
+            return jsonify({"message": "Current password is incorrect"}), 401
 
-        pw_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
-        user.password_hash = pw_hash
+        user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
         db.commit()
-        return jsonify({"message": "Password has been reset successfully"}), 200
+        return jsonify({"message": "Password changed successfully"}), 200
     except Exception:
         db.rollback()
-        logger.exception("Unexpected error while resetting password.")
+        logger.exception("Unexpected error while changing password.")
         return jsonify({"message": "An unexpected server error occurred. Please try again."}), 500
     finally:
         db.close()

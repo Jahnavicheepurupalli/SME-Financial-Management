@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import logging
 import tempfile
 import pymysql
@@ -19,6 +20,9 @@ SessionLocal = None
 is_sqlite = False
 
 # Try connecting to MySQL
+if not re.fullmatch(r"[A-Za-z0-9_]+", Config.MYSQL_DB):
+    raise ValueError("MYSQL_DB must contain only letters, numbers, and underscores.")
+
 try:
     logger.info(
         "Attempting to verify/create MySQL database '%s' at %s:%s...",
@@ -32,7 +36,7 @@ try:
         connect_timeout=3
     )
     cursor = conn.cursor()
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {Config.MYSQL_DB}")
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{Config.MYSQL_DB}`")
     conn.commit()
     cursor.close()
     conn.close()

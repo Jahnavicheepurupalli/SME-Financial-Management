@@ -130,14 +130,22 @@ def test_assemble_local_fallback_preserves_inputs(agent):
         },
         "charts": {"revenue_trend": [100]},
     }
-    result = agent._assemble_local_fallback(calculated, "source.csv")
+    result = agent._assemble_local_fallback(
+        calculated,
+        "source.csv",
+        "Test fallback reason.",
+    )
     assert set(result) == {
+        "analysis_mode",
         "current_state_analysis",
+        "data_quality",
+        "degraded_reason",
         "gap_detection",
         "forward_looking_flags",
         "missing_data_detection",
         "metrics",
         "charts",
+        "metrics_source",
     }
     assert result["metrics"] is calculated["metrics"]
     assert result["charts"] is calculated["charts"]
@@ -232,7 +240,7 @@ def test_pdf_generator_tool_success(monkeypatch):
 def test_pdf_generator_tool_document_not_found(monkeypatch):
     _, query, _ = _tool_db(monkeypatch)
     query.first = lambda: None
-    assert "not found" in pdf_generator_tool.func(1, "{}")
+    assert pdf_generator_tool.func(1, "{}") == "Error generating PDF for document 1."
 
 
 def test_pdf_generator_tool_bad_json(monkeypatch):
@@ -263,7 +271,7 @@ def test_mysql_storage_tool_success(monkeypatch):
 def test_mysql_storage_tool_document_not_found(monkeypatch):
     _, query, _ = _tool_db(monkeypatch)
     query.first = lambda: None
-    assert "not found" in mysql_storage_tool.func(1, "analyzed")
+    assert mysql_storage_tool.func(1, "analyzed") == "Error updating analysis status for document 1."
 
 
 def test_agent_init_and_mysql_error(monkeypatch):
@@ -280,12 +288,12 @@ def test_agent_init_and_mysql_error(monkeypatch):
         def close(self):
             pass
     monkeypatch.setattr(agent_module, "SessionLocal", lambda: BrokenDB())
-    assert "Error updating MySQL" in mysql_storage_tool.func(1, "analyzed")
+    assert mysql_storage_tool.func(1, "analyzed") == "Error updating analysis status for document 1."
 
 
 def _pipeline_fakes(monkeypatch, agent, llm):
     calls = {"pdf": [], "mongo": [], "mysql": []}
-    doc = SimpleNamespace(filename="ledger.csv", file_path="/tmp/ledger.csv")
+    doc = SimpleNamespace(filename="ledger.csv", file_path="/tmp/ledger.csv", user_id=1)
 
     class Query:
         def filter(self, *args):
@@ -297,6 +305,15 @@ def _pipeline_fakes(monkeypatch, agent, llm):
     class DB:
         def query(self, *args):
             return Query()
+
+        def add(self, obj):
+            pass
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
 
         def close(self):
             pass
@@ -322,6 +339,23 @@ def _pipeline_fakes(monkeypatch, agent, llm):
     monkeypatch.setattr(agent_module, "mysql_storage_tool", SimpleNamespace(
         func=lambda document_id, status: calls["mysql"].append((document_id, status)) or "mysql"
     ))
+    monkeypatch.setattr(
+        agent_module,
+        "_generate_pdf",
+        lambda document_id, analysis_data: calls["pdf"].append((document_id, analysis_data)) or "pdf",
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "_store_analysis_in_mongo",
+        lambda document_id, analysis_data, reasoning: (
+            calls["mongo"].append((document_id, analysis_data, reasoning)) or "mongo"
+        ),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "_update_mysql_storage",
+        lambda document_id, status: calls["mysql"].append((document_id, status)) or "mysql",
+    )
     agent.llm = llm
     return calls, calculated
 
@@ -357,14 +391,18 @@ def test_run_analysis_fallback_runs_side_effects_and_records_reasoning(monkeypat
     )
     result = agent.run_analysis(8)
     assert set(result) == {
+        "analysis_mode",
         "current_state_analysis",
+        "data_quality",
+        "degraded_reason",
         "gap_detection",
         "forward_looking_flags",
         "missing_data_detection",
         "metrics",
         "charts",
+        "metrics_source",
     }
     assert calls["pdf"][0][0] == 8
     assert calls["mongo"][0][0] == 8
-    assert "LLM offline" in calls["mongo"][0][2]
+    assert "Local rule-based fallback" in calls["mongo"][0][2]
     assert calls["mysql"] == [(8, "processing"), (8, "analyzed")]

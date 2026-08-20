@@ -1,6 +1,8 @@
 import json
 import socket
 
+import pytest
+
 from backend.database.db import MockMongoCollection, MockMongoDB, is_mongo_port_open
 
 
@@ -28,7 +30,8 @@ def test_mock_mongo_crud_and_corrupt_file(tmp_path):
     assert collection.delete_many({"group": "x"}).deleted_count == 2
 
     path.write_text("{not-json")
-    assert collection._read_data() == {}
+    with pytest.raises(json.JSONDecodeError):
+        collection._read_data()
 
 
 def test_mock_db_binds_collections_to_same_file(tmp_path):

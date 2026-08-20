@@ -1,5 +1,6 @@
 import os
 import logging
+from uuid import uuid4
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
@@ -130,7 +131,7 @@ def check_is_financial_file(file_path, file_type):
 @jwt_required()
 def upload_file():
     user_id = get_jwt_identity()
-    
+
     if 'file' not in request.files:
         return jsonify({"message": "No file part in the request"}), 400
         
@@ -149,9 +150,24 @@ def upload_file():
     except OSError:
         logger.exception("Unable to prepare upload folder %s.", Config.UPLOAD_FOLDER)
         return jsonify({"message": "Unable to prepare storage for the uploaded file. Please try again."}), 500
-    
+
     filename = secure_filename(file.filename)
-    file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
+    if not filename or not allowed_file(filename) or '.' not in filename:
+        return jsonify({"message": "The uploaded filename is invalid."}), 400
+
+    try:
+        numeric_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return jsonify({"message": "Invalid authenticated user"}), 401
+
+    user_upload_folder = os.path.join(Config.UPLOAD_FOLDER, str(numeric_user_id))
+    try:
+        os.makedirs(user_upload_folder, exist_ok=True)
+    except OSError:
+        logger.exception("Unable to prepare upload folder %s.", user_upload_folder)
+        return jsonify({"message": "Unable to prepare storage for the uploaded file. Please try again."}), 500
+
+    file_path = os.path.join(user_upload_folder, f"{uuid4().hex}_{filename}")
     try:
         file.save(file_path)
         file_size = os.path.getsize(file_path)
@@ -170,7 +186,7 @@ def upload_file():
             os.remove(file_path)
         except OSError:
             logger.warning("Unable to remove oversized upload %s.", file_path, exc_info=True)
-        return jsonify({"message": "File exceeds the 10MB size limit."}), 400
+        return jsonify({"message": "File exceeds the 10MB size limit."}), 413
 
     # Determine file type category
     ext = filename.rsplit('.', 1)[1].lower()
@@ -206,7 +222,7 @@ def upload_file():
     doc_record = None
     try:
         doc_record = Document(
-            user_id=int(user_id),
+            user_id=numeric_user_id,
             filename=filename,
             file_path=file_path,
             status="processing",

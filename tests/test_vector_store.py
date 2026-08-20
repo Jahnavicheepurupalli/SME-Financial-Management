@@ -13,6 +13,7 @@ def store():
     instance.model = None
     instance.chunks = []
     instance.embeddings = []
+    instance.keyword_only = False
     VectorStoreManager._instance = instance
     yield instance
     VectorStoreManager._instance = old
@@ -61,5 +62,6 @@ def test_embedding_path_vstack_and_failure_fallback(store):
     broken.model = BrokenModel()
     broken.chunks = []
     broken.embeddings = []
+    broken.keyword_only = False
     broken.add_chunks([{"text": "profit", "source_doc": "p"}])
     assert broken.similarity_search("profit") == [{"chunk": {"text": "profit", "source_doc": "p"}, "score": 1.0}]

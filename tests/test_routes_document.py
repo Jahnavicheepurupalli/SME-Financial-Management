@@ -42,7 +42,8 @@ def test_check_is_financial_file_csv_branches(tmp_path):
     empty = tmp_path / "empty.csv"
     empty.write_text("")
     assert document_module.check_is_financial_file(str(empty), "CSV") is False
-    assert document_module.check_is_financial_file(str(tmp_path / "missing.csv"), "CSV") is False
+    with pytest.raises(document_module.DocumentParseError):
+        document_module.check_is_financial_file(str(tmp_path / "missing.csv"), "CSV")
 
 
 def test_check_is_financial_file_excel_and_pdf(monkeypatch, tmp_path):
@@ -80,7 +81,7 @@ def test_upload_rejects_disallowed_extension(client, auth_token):
 def test_upload_rejects_oversized_file(client, auth_token, monkeypatch):
     real_getsize = document_module.os.path.getsize
     monkeypatch.setattr(document_module.os.path, "getsize", lambda path: 11 * 1024 * 1024)
-    assert client.post("/api/upload", data={"file": (io.BytesIO(b"revenue,assets\n1,2"), "large.csv")}, headers=_headers(auth_token), content_type="multipart/form-data").status_code == 400
+    assert client.post("/api/upload", data={"file": (io.BytesIO(b"revenue,assets\n1,2"), "large.csv")}, headers=_headers(auth_token), content_type="multipart/form-data").status_code == 413
     monkeypatch.setattr(document_module.os.path, "getsize", real_getsize)
 
 
@@ -88,7 +89,7 @@ def test_upload_rejects_non_financial_content(client, auth_token, monkeypatch, t
     monkeypatch.setattr(document_module, "check_is_financial_file", lambda *args: False)
     response = client.post("/api/upload", data={"file": (io.BytesIO(b"resume"), "resume.csv")}, headers=_headers(auth_token), content_type="multipart/form-data")
     assert response.status_code == 400
-    assert not (tmp_path / "uploads" / "resume.csv").exists()
+    assert not any(path.is_file() for path in (tmp_path / "uploads").rglob("*"))
 
 
 def test_upload_happy_path_persists_document(client, auth_token, monkeypatch, session_factory):
@@ -103,7 +104,10 @@ def test_upload_happy_path_persists_document(client, auth_token, monkeypatch, se
     body = response.get_json()
     assert body["success"] is True and body["document"]["filename"] == "good.csv"
     db = session_factory()
-    assert db.query(Document).filter(Document.filename == "good.csv").first() is not None
+    document = db.query(Document).filter(Document.filename == "good.csv").first()
+    assert document is not None
+    assert os.path.dirname(document.file_path).endswith(os.path.join("uploads", str(document.user_id)))
+    assert os.path.basename(document.file_path).endswith("_good.csv")
     db.close()
 
 

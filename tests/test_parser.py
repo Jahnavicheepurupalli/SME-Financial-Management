@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from PIL import Image
 
+from backend.exceptions import DocumentParseError
 from backend.services.parser import DocumentParser
 
 
@@ -27,7 +28,8 @@ def test_parse_csv_batches_and_limits(tmp_path):
     assert "Rows 1 to 50" in chunks[0]["text"]
     assert "Rows 451 to 500" in chunks[-1]["text"]
     assert all(c["source_doc"] == "data.csv" and c["page_num"] == 1 for c in chunks)
-    assert DocumentParser.parse_csv(str(tmp_path / "missing.csv")) == []
+    with pytest.raises(DocumentParseError):
+        DocumentParser.parse_csv(str(tmp_path / "missing.csv"))
 
 
 def test_parse_excel_multisheet_and_broken(tmp_path):
@@ -42,7 +44,8 @@ def test_parse_excel_multisheet_and_broken(tmp_path):
     assert "Excel Sheet: Balance" in chunks[1]["text"]
     broken = tmp_path / "broken.xlsx"
     broken.write_text("not excel")
-    assert DocumentParser.parse_excel(str(broken)) == []
+    with pytest.raises(DocumentParseError):
+        DocumentParser.parse_excel(str(broken))
 
 
 def test_parse_pdf_fallbacks(monkeypatch, tmp_path):
@@ -107,14 +110,18 @@ def test_ocr_pdf_and_image_paths(monkeypatch, tmp_path):
         def __iter__(self): return iter([Pix()])
         def __len__(self): return 1
         def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
     monkeypatch.setattr("backend.services.parser.fitz", type("Fit", (), {"open": staticmethod(lambda _: Doc())}))
     monkeypatch.setattr("backend.services.parser.pytesseract", type("T", (), {"image_to_string": staticmethod(lambda _: "OCR text")}))
     assert DocumentParser.ocr_pdf("scan.pdf")[0]["text"] == "OCR text"
     monkeypatch.setattr("backend.services.parser.pytesseract", type("T", (), {"image_to_string": staticmethod(lambda _: (_ for _ in ()).throw(RuntimeError("missing")))}))
-    assert "[Scanned Page 1]" in DocumentParser.ocr_pdf("scan.pdf")[0]["text"]
+    with pytest.raises(DocumentParseError):
+        DocumentParser.ocr_pdf("scan.pdf")
 
     image_path = tmp_path / "image.png"
     Image.new("RGB", (2, 2), "white").save(image_path)
     monkeypatch.setattr("backend.services.parser.pytesseract", type("T", (), {"image_to_string": staticmethod(lambda _: "image text")}))
     assert DocumentParser.parse_image(str(image_path))[0]["text"] == "image text"
-    assert DocumentParser.parse_image(str(tmp_path / "no.png")) == []
+    with pytest.raises(DocumentParseError):
+        DocumentParser.parse_image(str(tmp_path / "no.png"))
