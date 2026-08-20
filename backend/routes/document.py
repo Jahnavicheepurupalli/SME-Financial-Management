@@ -3,18 +3,42 @@ from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
 from backend.config import Config
-from backend.database.db import SessionLocal, mongo_db
+from backend.database.db import session_scope, mongo_db
 from backend.models.models import Document, AnalysisHistory
 from backend.services.parser import DocumentParser
 from backend.services.vector_store import VectorStoreManager
 from backend.agents.agent import FinancialIntelligenceAgent
+from backend.utils.paths import report_path
+from backend.utils.responses import error_response, success_response
+from backend.utils.serializers import serialize_document, serialize_history_entry
 
 doc_bp = Blueprint('document', __name__)
 
 ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls'}
 
+NON_FINANCIAL_MESSAGE = (
+    "This platform only accepts financial documents such as invoices, bank statements, "
+    "balance sheets, profit and loss statements, cash flow reports, and other business "
+    "financial records."
+)
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_owned_document(db, doc_id, user_id):
+    """Fetches a document only if it belongs to the authenticated user."""
+    return db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == int(user_id)
+    ).first()
+
+def remove_file_quietly(path, context):
+    if not path or not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except Exception as e:
+        print(f"[DEBUG {context}] Failed to delete {path}: {e}")
 
 def check_is_financial_file(file_path, file_type):
     """Classifies uploaded document content to ensure it is a valid financial document."""
@@ -101,16 +125,14 @@ def upload_file():
     user_id = get_jwt_identity()
     
     if 'file' not in request.files:
-        return jsonify({"message": "No file part in the request"}), 400
+        return error_response("No file part in the request")
         
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"message": "No selected file"}), 400
+        return error_response("No selected file")
 
     if not allowed_file(file.filename):
-        return jsonify({
-            "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
-        }), 400
+        return error_response(NON_FINANCIAL_MESSAGE)
 
     # Ensure upload folder exists
     os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
@@ -123,7 +145,7 @@ def upload_file():
     # Validate file size
     if file_size > 10 * 1024 * 1024:  # 10 MB limit
         os.remove(file_path)
-        return jsonify({"message": "File exceeds the 10MB size limit."}), 400
+        return error_response("File exceeds the 10MB size limit.")
 
     # Determine file type category
     ext = filename.rsplit('.', 1)[1].lower()
@@ -135,129 +157,98 @@ def upload_file():
 
     # content-based validation check before parser/db record/embeddings/analysis
     if not check_is_financial_file(file_path, file_type):
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        return jsonify({
-            "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
-        }), 400
+        remove_file_quietly(file_path, "VALIDATION")
+        return error_response(NON_FINANCIAL_MESSAGE)
 
     # Initialize MySQL DB session and create record since file is validated
-    db = SessionLocal()
     try:
-        doc_record = Document(
-            user_id=int(user_id),
-            filename=filename,
-            file_path=file_path,
-            status="processing",
-            file_type=file_type
-        )
-        db.add(doc_record)
-        db.commit()
-        db.refresh(doc_record)
-
-        # 1. Document Parsing & Text Extraction
-        chunks = []
-        if file_type == "PDF":
-            chunks = DocumentParser.parse_pdf(file_path)
-        elif file_type == "CSV":
-            chunks = DocumentParser.parse_csv(file_path)
-        elif file_type == "Excel":
-            chunks = DocumentParser.parse_excel(file_path)
-
-        if not chunks:
-            doc_record.status = "failed"
+        with session_scope() as db:
+            doc_record = Document(
+                user_id=int(user_id),
+                filename=filename,
+                file_path=file_path,
+                status="processing",
+                file_type=file_type
+            )
+            db.add(doc_record)
             db.commit()
-            return jsonify({"message": "Document contains no extractable data or is corrupted."}), 400
+            db.refresh(doc_record)
 
-        # 2. Chunking & Embeddings
-        vstore = VectorStoreManager.get_instance()
-        vstore.clear()  # Clear workspace cache
-        vstore.add_chunks(chunks)
-
-        # 3. LangChain Agent Execution
-        agent = FinancialIntelligenceAgent()
-        analysis_result = agent.run_analysis(doc_record.id)
-
-        return jsonify({
-            "success": True,
-            "current_state_analysis": analysis_result.get("current_state_analysis", {}),
-            "gap_detection": analysis_result.get("gap_detection", []),
-            "forward_looking_flags": analysis_result.get("forward_looking_flags", []),
-            "metrics": analysis_result.get("metrics", {}),
-            "charts": analysis_result.get("charts", {}),
-            "pdf_url": f"/api/report/{doc_record.id}",
-            "document": {
-                "id": doc_record.id,
-                "filename": doc_record.filename,
-                "file_type": doc_record.file_type,
-                "status": "analyzed"
+            # 1. Document Parsing & Text Extraction
+            parsers = {
+                "PDF": DocumentParser.parse_pdf,
+                "CSV": DocumentParser.parse_csv,
+                "Excel": DocumentParser.parse_excel
             }
-        }), 200
+            chunks = parsers[file_type](file_path) if file_type in parsers else []
+
+            if not chunks:
+                doc_record.status = "failed"
+                db.commit()
+                return error_response("Document contains no extractable data or is corrupted.")
+
+            # 2. Chunking & Embeddings
+            vstore = VectorStoreManager.get_instance()
+            vstore.clear()  # Clear workspace cache
+            vstore.add_chunks(chunks)
+
+            # 3. LangChain Agent Execution
+            agent = FinancialIntelligenceAgent()
+            analysis_result = agent.run_analysis(doc_record.id)
+
+            return success_response(
+                current_state_analysis=analysis_result.get("current_state_analysis", {}),
+                gap_detection=analysis_result.get("gap_detection", []),
+                forward_looking_flags=analysis_result.get("forward_looking_flags", []),
+                metrics=analysis_result.get("metrics", {}),
+                charts=analysis_result.get("charts", {}),
+                pdf_url=f"/api/report/{doc_record.id}",
+                document=serialize_document(doc_record, status="analyzed")
+            )
 
     except Exception as e:
-        db.rollback()
         import traceback
         traceback.print_exc()
-        return jsonify({"message": f"An error occurred during upload/analysis processing: {str(e)}"}), 500
-    finally:
-        db.close()
+        return error_response(f"An error occurred during upload/analysis processing: {str(e)}", 500)
 
 @doc_bp.route('/history', methods=['GET'])
 @jwt_required()
 def get_history():
     user_id = get_jwt_identity()
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         docs = db.query(Document).filter(Document.user_id == int(user_id)).order_by(Document.created_at.desc()).all()
-        history_list = []
-        for doc in docs:
-            history_list.append({
-                "id": doc.id,
-                "filename": doc.filename,
-                "file_type": doc.file_type,
-                "status": doc.status,
-                "created_at": doc.created_at.isoformat()
-            })
-        return jsonify({"history": history_list}), 200
-    finally:
-        db.close()
+        return jsonify({"history": [serialize_history_entry(doc) for doc in docs]}), 200
 
 @doc_bp.route('/history/<int:doc_id>', methods=['GET'])
 @jwt_required()
 def get_history_detail(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
-    try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
+    with session_scope() as db:
+        doc = get_owned_document(db, doc_id, user_id)
         if not doc:
-            return jsonify({"message": "Document not found"}), 404
+            return error_response("Document not found", 404)
             
         result = mongo_db["analysis_results"].find_one({"document_id": doc_id})
         if not result:
-            return jsonify({"message": "Analysis details not found"}), 404
+            return error_response("Analysis details not found", 404)
             
         if '_id' in result:
             result['_id'] = str(result['_id'])
             
         return jsonify({"analysis": result, "filename": doc.filename}), 200
-    finally:
-        db.close()
 
 @doc_bp.route('/report/<int:doc_id>', methods=['GET'])
 @jwt_required()
 def download_report(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
-    try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
+    with session_scope() as db:
+        doc = get_owned_document(db, doc_id, user_id)
         if not doc:
-            return jsonify({"message": "Document not found"}), 404
+            return error_response("Document not found", 404)
             
-        pdf_name = f"report_{doc_id}.pdf"
-        pdf_path = os.path.join(Config.REPORTS_FOLDER, pdf_name)
-        
+        pdf_path = report_path(doc_id)
         if not os.path.exists(pdf_path):
-            return jsonify({"message": "PDF report file not found on server."}), 404
+            return error_response("PDF report file not found on server.", 404)
             
         return send_file(
             pdf_path,
@@ -265,8 +256,6 @@ def download_report(doc_id):
             as_attachment=True,
             download_name=f"Financial_Analysis_{doc.filename}.pdf"
         )
-    finally:
-        db.close()
 
 @doc_bp.route('/chat', methods=['POST'])
 @doc_bp.route('/document/chat', methods=['POST'])
@@ -274,80 +263,57 @@ def download_report(doc_id):
 def chat_with_document():
     data = request.get_json()
     if not data or 'message' not in data or 'document_id' not in data:
-        return jsonify({"message": "Missing message or document_id"}), 400
+        return error_response("Missing message or document_id")
         
     doc_id = data['document_id']
     message = data['message']
     history = data.get('history', [])
     user_id = get_jwt_identity()
     
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found or unauthorized"}), 404
+        with session_scope() as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found or unauthorized", 404)
+                
+            agent = FinancialIntelligenceAgent()
+            response_text = agent.run_chat_query(doc_id, message, history)
             
-        agent = FinancialIntelligenceAgent()
-        response_text = agent.run_chat_query(doc_id, message, history)
-        
-        return jsonify({
-            "success": True,
-            "response": response_text
-        }), 200
+            return success_response(response=response_text)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"message": f"Chatbot error: {str(e)}"}), 500
-    finally:
-        db.close()
+        return error_response(f"Chatbot error: {str(e)}", 500)
 
 @doc_bp.route('/document/delete/<int:doc_id>', methods=['DELETE'])
 @jwt_required()
 def delete_document(doc_id):
     user_id = get_jwt_identity()
-    db = SessionLocal()
     try:
-        doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == int(user_id)).first()
-        if not doc:
-            return jsonify({"message": "Document not found or unauthorized"}), 404
+        with session_scope() as db:
+            doc = get_owned_document(db, doc_id, user_id)
+            if not doc:
+                return error_response("Document not found or unauthorized", 404)
+                
+            filename = doc.filename
+            file_path = doc.file_path
             
-        filename = doc.filename
-        file_path = doc.file_path
-        pdf_name = f"report_{doc_id}.pdf"
-        pdf_path = os.path.join(Config.REPORTS_FOLDER, pdf_name)
-        
-        # 1. Delete database records in MySQL
-        db.query(AnalysisHistory).filter(AnalysisHistory.document_id == doc_id).delete()
-        db.delete(doc)
-        db.commit()
-        
-        # 2. Delete analysis from MongoDB
-        mongo_db["analysis_results"].delete_one({"document_id": doc_id})
-        
-        # 3. Delete physical files if they exist
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete uploaded file: {e}")
-                
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete PDF report: {e}")
-                
-        # 4. Remove document chunks from vector store
-        vstore = VectorStoreManager.get_instance()
-        vstore.remove_document_chunks(filename)
-        
-        return jsonify({
-            "success": True,
-            "message": "Document deleted successfully"
-        }), 200
-        
+            # 1. Delete database records in MySQL
+            db.query(AnalysisHistory).filter(AnalysisHistory.document_id == doc_id).delete()
+            db.delete(doc)
+            db.commit()
+            
+            # 2. Delete analysis from MongoDB
+            mongo_db["analysis_results"].delete_one({"document_id": doc_id})
+            
+            # 3. Delete physical files if they exist
+            remove_file_quietly(file_path, "DELETE")
+            remove_file_quietly(report_path(doc_id), "DELETE")
+            
+            # 4. Remove document chunks from vector store
+            vstore = VectorStoreManager.get_instance()
+            vstore.remove_document_chunks(filename)
+            
+            return success_response("Document deleted successfully")
     except Exception as e:
-        db.rollback()
-        return jsonify({"message": f"Error deleting document: {str(e)}"}), 500
-    finally:
-        db.close()
+        return error_response(f"Error deleting document: {str(e)}", 500)
