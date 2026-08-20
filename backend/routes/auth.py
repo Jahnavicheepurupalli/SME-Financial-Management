@@ -1,4 +1,5 @@
 import re
+import logging
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, unset_jwt_cookies
 from flask_bcrypt import Bcrypt
@@ -7,33 +8,46 @@ from backend.models.models import User
 
 auth_bp = Blueprint('auth', __name__)
 bcrypt = Bcrypt()
+logger = logging.getLogger(__name__)
 
 # Password validation regex
 PASSWORD_REGEX = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
+EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 def validate_password(password):
-    return re.match(PASSWORD_REGEX, password) is not None
+    return isinstance(password, str) and re.match(PASSWORD_REGEX, password) is not None
+
+
+def normalize_email(email):
+    return email.strip().lower() if isinstance(email, str) else ""
+
+
+def valid_email(email):
+    return len(email) <= 255 and re.fullmatch(EMAIL_REGEX, email) is not None
 
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json() or {}
-    print(f"[DEBUG] Incoming signup request: {data}")
     
     full_name = data.get('name') or data.get('full_name')
-    email = data.get('email')
+    email = normalize_email(data.get('email'))
     password = data.get('password')
     confirm_password = data.get('confirm_password')
 
-    if not all([full_name, email, password]):
-        print("[DEBUG] Signup validation failed: missing name, email, or password.")
+    if not isinstance(full_name, str) or not full_name.strip() or len(full_name.strip()) > 255:
+        return jsonify({"message": "Name is required and must be 255 characters or fewer"}), 400
+
+    full_name = full_name.strip()
+    if not email or not valid_email(email):
+        return jsonify({"message": "A valid email address is required"}), 400
+
+    if not isinstance(password, str) or not password:
         return jsonify({"message": "Name, email, and password are required"}), 400
 
     if confirm_password and password != confirm_password:
-        print("[DEBUG] Signup validation failed: password mismatch.")
         return jsonify({"message": "Passwords do not match"}), 400
 
     if not validate_password(password):
-        print("[DEBUG] Signup validation failed: password does not meet complexity rules.")
         return jsonify({
             "message": "Password must be at least 8 characters long, contain an uppercase letter, a lowercase letter, a number, and a special character."
         }), 400
@@ -42,7 +56,6 @@ def signup():
     try:
         existing_user = db.query(User).filter(User.email == email).first()
         if existing_user:
-            print(f"[DEBUG] Signup failed: email {email} already registered.")
             return jsonify({"message": "Email already registered"}), 400
 
         pw_hash = bcrypt.generate_password_hash(password).decode('utf-8')
@@ -50,7 +63,6 @@ def signup():
         
         db.add(new_user)
         db.commit()
-        print(f"[DEBUG] Signup success: user {email} created.")
         return jsonify({
             "success": True,
             "message": "Registration successful",
@@ -62,18 +74,18 @@ def signup():
         }), 201
     except Exception as e:
         db.rollback()
-        print(f"[DEBUG] Signup Exception: {str(e)}")
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Signup failed")
+        return jsonify({"message": "Unable to complete registration"}), 500
     finally:
         db.close()
 
 @auth_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json() or {}
-    email = data.get('email')
+    email = normalize_email(data.get('email'))
     password = data.get('password')
 
-    if not email or not password:
+    if not email or not valid_email(email) or not isinstance(password, str) or not password:
         return jsonify({"message": "Email and password are required"}), 400
 
     db = SessionLocal()
@@ -97,7 +109,8 @@ def login():
             }
         }), 200
     except Exception as e:
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Login failed")
+        return jsonify({"message": "Unable to complete login"}), 500
     finally:
         db.close()
 
@@ -131,7 +144,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except ValueError as ve:
         err_str = str(ve).lower()
-        print(f"[DEBUG OAUTH] Token verification ValueError: {ve}")
+        logger.exception("Google token verification failed")
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -140,7 +153,7 @@ def google_login():
             return jsonify({"message": "Unable to verify your Google account. Please try again."}), 401
     except Exception as e:
         err_str = str(e).lower()
-        print(f"[DEBUG OAUTH] Token verification exception: {e}")
+        logger.exception("Google token verification failed")
         if "client" in err_str or "audience" in err_str:
             return jsonify({"message": "Google authentication is temporarily unavailable. Please contact the administrator."}), 401
         elif "test" in err_str or "access_denied" in err_str or "unauthorized" in err_str or "consent" in err_str:
@@ -169,21 +182,32 @@ def google_login():
         }), 200
     except Exception as e:
         db.rollback()
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Google login failed")
+        return jsonify({"message": "Unable to complete Google authentication"}), 500
     finally:
         db.close()
 
 @auth_bp.route('/forgot-password', methods=['POST'])
 @auth_bp.route('/reset-password', methods=['POST'])
 def forgot_password():
-    """No OTP/verification flow. Verifies email, then updates password directly."""
+    """Self-service password reset is unavailable without email verification."""
+    return jsonify({
+        "message": "Self-service password reset is unavailable. Please contact the administrator."
+    }), 503
+
+
+@auth_bp.route('/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
     data = request.get_json() or {}
-    email = data.get('email')
+    current_password = data.get('current_password')
     new_password = data.get('new_password')
     confirm_password = data.get('confirm_password')
 
-    if not all([email, new_password, confirm_password]):
-        return jsonify({"message": "Email and new passwords are required"}), 400
+    if not all(isinstance(value, str) and value for value in (
+        current_password, new_password, confirm_password
+    )):
+        return jsonify({"message": "Current and new passwords are required"}), 400
 
     if new_password != confirm_password:
         return jsonify({"message": "Passwords do not match"}), 400
@@ -195,17 +219,23 @@ def forgot_password():
 
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == email).first()
+        user = db.query(User).filter(User.id == int(get_jwt_identity())).first()
         if not user:
-            return jsonify({"message": "User not found with this email"}), 404
+            return jsonify({"message": "Account not found"}), 404
+        if not user.password_hash:
+            return jsonify({
+                "message": "Password changes are unavailable for Google-only accounts."
+            }), 400
+        if not bcrypt.check_password_hash(user.password_hash, current_password):
+            return jsonify({"message": "Current password is incorrect"}), 401
 
-        pw_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
-        user.password_hash = pw_hash
+        user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
         db.commit()
-        return jsonify({"message": "Password has been reset successfully"}), 200
+        return jsonify({"message": "Password changed successfully"}), 200
     except Exception as e:
         db.rollback()
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
+        logger.exception("Password change failed")
+        return jsonify({"message": "Unable to change password"}), 500
     finally:
         db.close()
 

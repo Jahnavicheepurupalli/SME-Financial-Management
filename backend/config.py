@@ -1,12 +1,46 @@
 import os
+import logging
+import re
+import secrets
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 class Config:
-    SECRET_KEY = os.getenv("JWT_SECRET_KEY", "sme-fintech-jwt-secret-key-1029384756")
+    APP_ENV = os.getenv("FLASK_ENV", os.getenv("APP_ENV", "development")).strip().lower()
+    DEBUG = _env_flag("FLASK_DEBUG", False)
+    _configured_secret = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+    if not _configured_secret:
+        if APP_ENV == "production":
+            raise RuntimeError(
+                "JWT_SECRET_KEY (or SECRET_KEY) must be set in production."
+            )
+        _configured_secret = secrets.token_urlsafe(32)
+        logger.warning(
+            "JWT secret is not configured; using an ephemeral development secret. "
+            "Tokens will not survive restarts."
+        )
+    SECRET_KEY = _configured_secret
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    ALLOWED_ORIGINS = [
+        origin.strip()
+        for origin in os.getenv(
+            "ALLOWED_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ]
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024
     
     # MySQL Config
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")

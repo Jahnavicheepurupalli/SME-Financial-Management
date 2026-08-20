@@ -6,7 +6,7 @@ import Signup from './pages/Signup';
 import ForgotPassword from './pages/ForgotPassword';
 import Dashboard from './pages/Dashboard';
 
-function App() {
+function App({ googleAuthEnabled }) {
   const [darkMode, setDarkMode] = useState(() => {
     return localStorage.getItem('theme') === 'dark' || 
       (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -37,8 +37,8 @@ function App() {
     <Router>
       <Routes>
         <Route path="/" element={<Landing darkMode={darkMode} toggleDarkMode={toggleDarkMode} />} />
-        <Route path="/login" element={<Login darkMode={darkMode} toggleDarkMode={toggleDarkMode} />} />
-        <Route path="/signup" element={<Signup darkMode={darkMode} toggleDarkMode={toggleDarkMode} />} />
+        <Route path="/login" element={<Login darkMode={darkMode} toggleDarkMode={toggleDarkMode} googleAuthEnabled={googleAuthEnabled} />} />
+        <Route path="/signup" element={<Signup darkMode={darkMode} toggleDarkMode={toggleDarkMode} googleAuthEnabled={googleAuthEnabled} />} />
         <Route path="/forgot-password" element={<ForgotPassword darkMode={darkMode} toggleDarkMode={toggleDarkMode} />} />
         <Route 
           path="/dashboard" 

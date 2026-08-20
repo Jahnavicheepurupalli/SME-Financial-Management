@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import pymysql
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -17,6 +18,9 @@ SessionLocal = None
 is_sqlite = False
 
 # Try connecting to MySQL
+if not re.fullmatch(r"[A-Za-z0-9_]+", Config.MYSQL_DB):
+    raise ValueError("MYSQL_DB must contain only letters, numbers, and underscores.")
+
 try:
     print(f"Attempting to verify/create MySQL database '{Config.MYSQL_DB}' at {Config.MYSQL_HOST}:{Config.MYSQL_PORT}...")
     conn = pymysql.connect(
@@ -27,7 +31,7 @@ try:
         connect_timeout=3
     )
     cursor = conn.cursor()
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {Config.MYSQL_DB}")
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{Config.MYSQL_DB}`")
     conn.commit()
     cursor.close()
     conn.close()

@@ -7,6 +7,13 @@ venv/
 backend/.env
 frontend/.env
 
+# Generated runtime data
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/reports/*
+!backend/reports/.gitkeep
+backend/database/mock_mongodb.json
+
 # Database
 *.db
 *.sqlite3

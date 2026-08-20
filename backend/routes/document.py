@@ -1,4 +1,6 @@
 import os
+import logging
+from uuid import uuid4
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
@@ -10,6 +12,7 @@ from backend.services.vector_store import VectorStoreManager
 from backend.agents.agent import FinancialIntelligenceAgent
 
 doc_bp = Blueprint('document', __name__)
+logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls'}
 
@@ -49,7 +52,7 @@ def check_is_financial_file(file_path, file_type):
                 text = "\n".join(rows)
             wb.close()
     except Exception as e:
-        print(f"[DEBUG VALIDATION] Fast validation extraction error: {e}")
+        logger.exception("Fast validation extraction failed")
         return False
 
     if not text or not text.strip():
@@ -84,12 +87,12 @@ def check_is_financial_file(file_path, file_type):
 
     # If document has resume/academic/certificate indicators and weak financial context, reject
     if len(non_fin_matches) >= 2 or (len(non_fin_matches) >= 1 and len(fin_matches) < 3):
-        print(f"[VALIDATION] Rejected non-financial document. Non-financial keywords found: {non_fin_matches}")
+        logger.warning("Rejected non-financial document")
         return False
 
     # Require at least 2 distinct financial keywords
     if len(fin_matches) < 2:
-        print(f"[VALIDATION] Rejected document. Insufficient financial keywords found: {fin_matches}")
+        logger.warning("Rejected document with insufficient financial keywords")
         return False
 
     return True
@@ -112,18 +115,26 @@ def upload_file():
             "message": "This platform only accepts financial documents such as invoices, bank statements, balance sheets, profit and loss statements, cash flow reports, and other business financial records."
         }), 400
 
-    # Ensure upload folder exists
-    os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-    
+    # Keep the display name separate from the unique path used on disk.
     filename = secure_filename(file.filename)
-    file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
+    if not filename or not allowed_file(filename) or '.' not in filename:
+        return jsonify({"message": "The uploaded filename is invalid."}), 400
+
+    try:
+        numeric_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return jsonify({"message": "Invalid authenticated user"}), 401
+
+    user_upload_folder = os.path.join(Config.UPLOAD_FOLDER, str(numeric_user_id))
+    os.makedirs(user_upload_folder, exist_ok=True)
+    file_path = os.path.join(user_upload_folder, f"{uuid4().hex}_{filename}")
     file.save(file_path)
     file_size = os.path.getsize(file_path)
 
     # Validate file size
     if file_size > 10 * 1024 * 1024:  # 10 MB limit
         os.remove(file_path)
-        return jsonify({"message": "File exceeds the 10MB size limit."}), 400
+        return jsonify({"message": "File exceeds the 10MB size limit."}), 413
 
     # Determine file type category
     ext = filename.rsplit('.', 1)[1].lower()
@@ -145,7 +156,7 @@ def upload_file():
     db = SessionLocal()
     try:
         doc_record = Document(
-            user_id=int(user_id),
+            user_id=numeric_user_id,
             filename=filename,
             file_path=file_path,
             status="processing",
@@ -196,9 +207,8 @@ def upload_file():
 
     except Exception as e:
         db.rollback()
-        import traceback
-        traceback.print_exc()
-        return jsonify({"message": f"An error occurred during upload/analysis processing: {str(e)}"}), 500
+        logger.exception("Upload or analysis processing failed")
+        return jsonify({"message": "An error occurred during upload/analysis processing."}), 500
     finally:
         db.close()
 
@@ -295,9 +305,8 @@ def chat_with_document():
             "response": response_text
         }), 200
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"message": f"Chatbot error: {str(e)}"}), 500
+        logger.exception("Chatbot request failed")
+        return jsonify({"message": "Chatbot request failed."}), 500
     finally:
         db.close()
 
@@ -329,13 +338,13 @@ def delete_document(doc_id):
             try:
                 os.remove(file_path)
             except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete uploaded file: {e}")
+                logger.exception("Failed to delete uploaded file")
                 
         if os.path.exists(pdf_path):
             try:
                 os.remove(pdf_path)
             except Exception as e:
-                print(f"[DEBUG DELETE] Failed to delete PDF report: {e}")
+                logger.exception("Failed to delete PDF report")
                 
         # 4. Remove document chunks from vector store
         vstore = VectorStoreManager.get_instance()
@@ -348,6 +357,7 @@ def delete_document(doc_id):
         
     except Exception as e:
         db.rollback()
-        return jsonify({"message": f"Error deleting document: {str(e)}"}), 500
+        logger.exception("Document deletion failed")
+        return jsonify({"message": "Error deleting document."}), 500
     finally:
         db.close()

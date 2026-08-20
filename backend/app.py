@@ -13,9 +13,10 @@ _user_site = site.getusersitepackages()
 if _user_site and _user_site not in sys.path:
     sys.path.append(_user_site)
 
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
+from werkzeug.exceptions import RequestEntityTooLarge
 from backend.config import Config
 from backend.database.db import engine, Base
 from backend.routes.auth import auth_bp
@@ -39,11 +40,17 @@ app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 3600 * 24  # 24 hours expiry
 
 # Configure CORS to allow frontend requests
 CORS(
-    app, 
-    resources={r"/*": {"origins": "*"}}, 
+    app,
+    resources={r"/*": {"origins": Config.ALLOWED_ORIGINS}},
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"]
 )
+app.config["MAX_CONTENT_LENGTH"] = Config.MAX_CONTENT_LENGTH
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_entity_too_large(error):
+    return jsonify({"message": "File exceeds the 10MB size limit."}), 413
 
 # Initialize JWT Manager
 jwt = JWTManager(app)
@@ -69,4 +76,4 @@ def health():
 if __name__ == '__main__':
     # Start flask application
     print("Starting Flask server on port 5000...")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=Config.DEBUG)
