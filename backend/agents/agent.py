@@ -555,7 +555,7 @@ Document Context Chunks:
                             net_inc = float(str(row.get("net income", row.get("net_profit", 0))).replace(",", ""))
                             profs.append(net_inc)
                             exps.append(revs[-1] - net_inc)
-                            cfs.append(float(str(row.get("cash flow from operating", net_inc * 1.1))).replace(",", ""))
+                            cfs.append(float(str(row.get("cash flow from operating", net_inc * 1.1)).replace(",", "")))
                             labels.append(str(row.get("year", row.get("company", f"Yr {r_idx+1}"))))
                             
                         charts["monthly_comparison"]["labels"] = labels

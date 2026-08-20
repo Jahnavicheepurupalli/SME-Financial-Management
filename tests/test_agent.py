@@ -100,15 +100,20 @@ def test_calculate_metrics_missing_file_uses_chunk_regex(agent, tmp_path):
     assert result["charts"]["monthly_comparison"]["labels"] == ["Q1", "Q2", "Q3", "Q4"]
 
 
-@pytest.mark.xfail(reason="production bug: financial-statement cash-flow branch calls replace on a float")
-def test_financial_statement_branch_current_behavior(agent, tmp_path):
+def test_financial_statement_branch_comma_formatted_cash_flow(agent, tmp_path):
     path = tmp_path / "statement.csv"
     pd.DataFrame(
-        {"year": [2024], "revenue": [1000], "net income": [100], "cash flow from operating": [90]}
+        {
+            "year": [2024, 2023],
+            "revenue": ["1,000", "900"],
+            "net income": ["100", "90"],
+            "cash flow from operating": ["9,000", "8,100"],
+        }
     ).to_csv(path, index=False)
     result = agent._calculate_metrics_directly(str(path), [], "statement.csv")
     assert result["metrics"]["total_revenue"] == 1000
-    assert result["charts"]["cash_flow"] == [90]
+    assert result["metrics"]["cash_flow"] == 9000
+    assert result["charts"]["cash_flow"] == [8100.0, 9000.0]
 
 
 def test_assemble_local_fallback_preserves_inputs(agent):
