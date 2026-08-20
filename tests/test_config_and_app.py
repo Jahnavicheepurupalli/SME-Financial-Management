@@ -1,7 +1,5 @@
 import importlib
 
-import pytest
-
 
 def test_validate_oauth_config(monkeypatch):
     from backend.config import Config
